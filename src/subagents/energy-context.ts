@@ -2,6 +2,7 @@ import type { EnergyDay } from '../db/schema.js';
 import { fetchEnergy } from '../tools/energy-fetch.js';
 import { DEFAULT_REFERENCE_ISO, DEFAULT_TIMEZONE } from '../dates.js';
 import { DEFAULT_SUBAGENT_MODEL, getAnthropicClient } from './anthropic.js';
+import { fromAnthropicUsage, type TokenUsageSummary } from '../usage.js';
 
 export type EnergyContextInput = {
   currentHour: number;
@@ -18,6 +19,7 @@ export type EnergyContextPayload = {
 export type EnergyContextResult = {
   summary: string;
   payload: EnergyContextPayload;
+  usage: TokenUsageSummary;
 };
 
 function buildPayload(day: EnergyDay, currentHour: number): EnergyContextPayload {
@@ -29,7 +31,9 @@ function buildPayload(day: EnergyDay, currentHour: number): EnergyContextPayload
   };
 }
 
-async function summarizeEnergyContext(payload: EnergyContextPayload): Promise<string> {
+async function summarizeEnergyContext(
+  payload: EnergyContextPayload,
+): Promise<{ summary: string; usage: TokenUsageSummary }> {
   const client = getAnthropicClient();
   const response = await client.messages.create({
     model: DEFAULT_SUBAGENT_MODEL,
@@ -45,7 +49,10 @@ async function summarizeEnergyContext(payload: EnergyContextPayload): Promise<st
   });
 
   const textBlock = response.content.find((block) => block.type === 'text');
-  return textBlock?.text.trim() ?? '';
+  return {
+    summary: textBlock?.text.trim() ?? '',
+    usage: fromAnthropicUsage(response.usage),
+  };
 }
 
 export async function getEnergyContext(input: EnergyContextInput): Promise<EnergyContextResult> {
@@ -59,11 +66,12 @@ export async function getEnergyContext(input: EnergyContextInput): Promise<Energ
   }
 
   const payload = buildPayload(day, input.currentHour);
-  const summary = await summarizeEnergyContext(payload);
+  const result = await summarizeEnergyContext(payload);
 
   return {
-    summary,
+    summary: result.summary,
     payload,
+    usage: result.usage,
   };
 }
 

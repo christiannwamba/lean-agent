@@ -2,6 +2,7 @@ import type { Task } from '../db/schema.js';
 import { DEFAULT_REFERENCE_ISO } from '../dates.js';
 import { fetchTasks } from '../tools/task-fetch.js';
 import { DEFAULT_SUBAGENT_MODEL, getAnthropicClient } from './anthropic.js';
+import { fromAnthropicUsage, type TokenUsageSummary } from '../usage.js';
 
 export type TaskContextInput = {
   referenceInstant?: string;
@@ -23,6 +24,7 @@ export type TaskContextPayload = {
 export type TaskContextResult = {
   summary: string;
   payload: TaskContextPayload;
+  usage: TokenUsageSummary;
 };
 
 function buildPayload(referenceInstant: string): TaskContextPayload {
@@ -42,7 +44,9 @@ function buildPayload(referenceInstant: string): TaskContextPayload {
   };
 }
 
-async function summarizeTaskContext(payload: TaskContextPayload): Promise<string> {
+async function summarizeTaskContext(
+  payload: TaskContextPayload,
+): Promise<{ summary: string; usage: TokenUsageSummary }> {
   const client = getAnthropicClient();
   const response = await client.messages.create({
     model: DEFAULT_SUBAGENT_MODEL,
@@ -58,15 +62,19 @@ async function summarizeTaskContext(payload: TaskContextPayload): Promise<string
   });
 
   const textBlock = response.content.find((block) => block.type === 'text');
-  return textBlock?.text.trim() ?? '';
+  return {
+    summary: textBlock?.text.trim() ?? '',
+    usage: fromAnthropicUsage(response.usage),
+  };
 }
 
 export async function getTaskContext(input: TaskContextInput = {}): Promise<TaskContextResult> {
   const payload = buildPayload(input.referenceInstant ?? DEFAULT_REFERENCE_ISO);
-  const summary = await summarizeTaskContext(payload);
+  const result = await summarizeTaskContext(payload);
 
   return {
-    summary,
+    summary: result.summary,
     payload,
+    usage: result.usage,
   };
 }

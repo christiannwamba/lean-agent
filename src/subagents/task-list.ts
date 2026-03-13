@@ -1,6 +1,7 @@
 import type { Task } from '../db/schema.js';
 import { fetchTasks } from '../tools/task-fetch.js';
 import { DEFAULT_SUBAGENT_MODEL, getAnthropicClient } from './anthropic.js';
+import { fromAnthropicUsage, type TokenUsageSummary } from '../usage.js';
 
 export type TaskListInput = {
   status?: Task['status'];
@@ -21,6 +22,7 @@ export type TaskListPayload = {
 export type TaskListResult = {
   summary: string;
   payload: TaskListPayload;
+  usage: TokenUsageSummary;
 };
 
 function buildPayload(status?: Task['status']): TaskListPayload {
@@ -37,7 +39,9 @@ function buildPayload(status?: Task['status']): TaskListPayload {
   return { tasks };
 }
 
-async function summarizeTaskList(payload: TaskListPayload): Promise<string> {
+async function summarizeTaskList(
+  payload: TaskListPayload,
+): Promise<{ summary: string; usage: TokenUsageSummary }> {
   const client = getAnthropicClient();
   const response = await client.messages.create({
     model: DEFAULT_SUBAGENT_MODEL,
@@ -53,15 +57,19 @@ async function summarizeTaskList(payload: TaskListPayload): Promise<string> {
   });
 
   const textBlock = response.content.find((block) => block.type === 'text');
-  return textBlock?.text.trim() ?? '';
+  return {
+    summary: textBlock?.text.trim() ?? '',
+    usage: fromAnthropicUsage(response.usage),
+  };
 }
 
 export async function getTaskList(input: TaskListInput = {}): Promise<TaskListResult> {
   const payload = buildPayload(input.status);
-  const summary = await summarizeTaskList(payload);
+  const result = await summarizeTaskList(payload);
 
   return {
-    summary,
+    summary: result.summary,
     payload,
+    usage: result.usage,
   };
 }

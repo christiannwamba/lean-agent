@@ -6,8 +6,6 @@ import process from 'node:process';
 
 import { DEFAULT_REFERENCE_ISO, DEFAULT_TIMEZONE } from './dates.js';
 import {
-  COMPACTION_THRESHOLD_TOKENS,
-  MAX_CONTEXT_TOKENS,
   runChatTurn,
   createTerminalLogger,
   type ChatSessionConfig,
@@ -100,6 +98,7 @@ async function runChat(options: ChatOptions): Promise<void> {
   console.log(`Seeded demo with energy=${config.energyLabel}, tasks=${config.taskLabel}, hour=${config.currentHour}, tz=${config.timezone}`);
   console.log('Type `exit` or `quit` to end the session.');
   let history: Anthropic.Beta.Messages.BetaMessageParam[] = [];
+  let sessionTokenTotal = 0;
 
   try {
     while (true) {
@@ -165,17 +164,16 @@ async function runChat(options: ChatOptions): Promise<void> {
       stopLoading();
 
       history = result.history as Anthropic.Beta.Messages.BetaMessageParam[];
+      sessionTokenTotal += result.usage.total.totalTokens;
 
       const rendered = renderAssistantOutput(result.assistantText);
       if (rendered) {
         console.log(rendered);
       }
 
-      const warning =
-        result.contextTokens >= COMPACTION_THRESHOLD_TOKENS ? ' compaction-soon' : '';
       console.log(
         chalk.dim(
-          `[context: ${result.contextTokens.toLocaleString()} / ${MAX_CONTEXT_TOKENS.toLocaleString()} tokens${warning}]`,
+          `[tokens: turn ${result.usage.total.totalTokens.toLocaleString()} | session ${sessionTokenTotal.toLocaleString()} | main ${result.usage.main.totalTokens.toLocaleString()} | subagents ${result.usage.subagents.totalTokens.toLocaleString()}]`,
         ),
       );
     }

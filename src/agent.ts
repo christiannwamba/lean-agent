@@ -14,6 +14,12 @@ import { createTask } from "./tools/task-create.js";
 import { deleteTask } from "./tools/task-delete.js";
 import { resolveTask } from "./tools/task-resolve.js";
 import { updateTask } from "./tools/task-update.js";
+import {
+  addTokenUsage,
+  emptyTokenUsage,
+  fromAnthropicUsage,
+  type TokenUsageSummary,
+} from "./usage.js";
 
 type LogKind = "skill" | "tool" | "subagent";
 
@@ -31,8 +37,6 @@ type TerminalLoggerOptions = {
   afterEachLog?: () => void;
 };
 
-export const MAX_CONTEXT_TOKENS = 10_000;
-export const COMPACTION_THRESHOLD_TOKENS = 8_000;
 const DEFAULT_CHAT_MODEL = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6";
 
 export type ChatSessionConfig = {
@@ -51,7 +55,11 @@ export type ChatTurnParams = {
 export type ChatTurnResult = {
   history: Anthropic.Beta.Messages.BetaMessageParam[];
   assistantText: string;
-  contextTokens: number;
+  usage: {
+    main: TokenUsageSummary;
+    subagents: TokenUsageSummary;
+    total: TokenUsageSummary;
+  };
 };
 
 const createTaskInputSchema = z.object({
@@ -143,7 +151,11 @@ function buildSystemPrompt(config: ChatSessionConfig): string {
   ].join("\n\n");
 }
 
-export function buildTools(config: ChatSessionConfig, logger: AgentLogger) {
+export function buildTools(
+  config: ChatSessionConfig,
+  logger: AgentLogger,
+  trackSubagentUsage?: (usage: TokenUsageSummary) => void,
+) {
   const resolvedTaskIds = new Set<number>();
 
   return [
@@ -255,6 +267,7 @@ export function buildTools(config: ChatSessionConfig, logger: AgentLogger) {
           currentHour: currentHour ?? config.currentHour,
           label,
         });
+        trackSubagentUsage?.(result.usage);
         return result.summary;
       },
     }),
@@ -268,6 +281,7 @@ export function buildTools(config: ChatSessionConfig, logger: AgentLogger) {
         const result = await getTaskContext({
           referenceInstant: config.referenceInstant ?? DEFAULT_REFERENCE_ISO,
         });
+        trackSubagentUsage?.(result.usage);
         return result.summary;
       },
     }),
@@ -281,16 +295,31 @@ export function buildTools(config: ChatSessionConfig, logger: AgentLogger) {
       run: async ({ status }) => {
         logger.log("subagent", "task-list");
         const result = await getTaskList({ status });
+        trackSubagentUsage?.(result.usage);
         return result.summary;
       },
     }),
   ];
 }
 
+function usageFromIterations(
+  usage: Anthropic.Beta.Messages.BetaUsage,
+): TokenUsageSummary {
+  const iterations = usage.iterations ?? [];
+  if (iterations.length === 0) {
+    return fromAnthropicUsage(usage);
+  }
+
+  return iterations.reduce((total, iteration) => {
+    return addTokenUsage(total, fromAnthropicUsage(iteration));
+  }, emptyTokenUsage());
+}
+
 function buildRequestParams(
   config: ChatSessionConfig,
   messages: Anthropic.Beta.Messages.BetaMessageParam[],
   logger: AgentLogger,
+  trackSubagentUsage?: (usage: TokenUsageSummary) => void,
 ) {
   return {
     model: DEFAULT_CHAT_MODEL,
@@ -299,33 +328,15 @@ function buildRequestParams(
     stream: true as const,
     system: buildSystemPrompt(config),
     messages,
-    tools: buildTools(config, logger),
+    tools: buildTools(config, logger, trackSubagentUsage),
   };
-}
-
-export async function countContextTokens(
-  client: Anthropic,
-  config: ChatSessionConfig,
-  history: Anthropic.Beta.Messages.BetaMessageParam[],
-): Promise<number> {
-  const request = buildRequestParams(config, history, {
-    log() {},
-  });
-
-  const result = await client.beta.messages.countTokens({
-    model: request.model,
-    messages: request.messages,
-    system: request.system,
-    tools: request.tools,
-  });
-
-  return result.input_tokens;
 }
 
 export async function runChatTurn(
   params: ChatTurnParams,
 ): Promise<ChatTurnResult> {
   const client = getAnthropicClient();
+  let subagentUsage = emptyTokenUsage();
   const userMessage: Anthropic.Beta.Messages.BetaMessageParam = {
     role: "user",
     content: params.userInput,
@@ -336,7 +347,9 @@ export async function runChatTurn(
   ];
 
   const runner = client.beta.messages.toolRunner(
-    buildRequestParams(params.config, messages, params.logger),
+    buildRequestParams(params.config, messages, params.logger, (usage) => {
+      subagentUsage = addTokenUsage(subagentUsage, usage);
+    }),
     {},
   );
 
@@ -360,12 +373,17 @@ export async function runChatTurn(
       content: finalMessage.content,
     },
   ];
-  const contextTokens = await countContextTokens(client, params.config, history);
+  const mainUsage = usageFromIterations(finalMessage.usage);
+  const totalUsage = addTokenUsage(mainUsage, subagentUsage);
 
   return {
     history,
     assistantText,
-    contextTokens,
+    usage: {
+      main: mainUsage,
+      subagents: subagentUsage,
+      total: totalUsage,
+    },
   };
 }
 

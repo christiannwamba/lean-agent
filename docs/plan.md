@@ -555,3 +555,246 @@ Tests that long chat sessions preserve current scenario, task mutations, user pr
 
 16. Error handling — API failures, malformed tool inputs, ambiguous task matches, empty scenarios.
 17. Demo walkthrough — verify all log lines appear, compaction triggers, subagent logs visible.
+
+---
+
+## Implementation Checkpoints
+
+This section is the execution source of truth for incremental implementation. Work proceeds bundle by bundle. Stop after each bundle, run the listed verification steps in sequence, and only continue after confirming the results.
+
+### Bundle A: Runtime + Database Foundation
+
+Scope:
+
+1. Project bootstrap
+   - `package.json`
+   - `tsconfig.json`
+   - Bun runtime metadata
+   - base scripts
+2. Database foundation
+   - Drizzle config
+   - SQLite connection
+   - schema for `tasks` and `energy_days`
+   - `data/` directory bootstrap
+
+Verification:
+
+```bash
+bun install
+bun run typecheck
+bun run db:push
+sqlite3 data/lean-agent.db "select name from sqlite_master where type='table' order by name;"
+sqlite3 data/lean-agent.db "pragma table_info(tasks);"
+sqlite3 data/lean-agent.db "pragma table_info(energy_days);"
+```
+
+Expected checks:
+
+- install succeeds
+- typecheck passes
+- schema push succeeds
+- `tasks` contains `deadline_at`, `deadline_timezone`, `deadline_raw`
+- `energy_days` contains `timezone`
+
+### Bundle B: Seed Data + Deadline Parsing
+
+Scope:
+
+3. Seed system
+   - 5 energy scenarios
+   - 5 task scenarios
+   - destructive reset + insert flow
+4. Date parsing helpers
+   - natural-language deadline parsing
+   - normalization to ISO UTC
+   - preserve raw user text and timezone
+
+Verification:
+
+```bash
+bun run typecheck
+bun run seed -- --list
+bun run parse-date -- "tomorrow at 4pm" --ref 2026-03-13T09:00:00.000Z --tz Europe/London
+
+bun run seed -- --energy well_rested --tasks deadline_pressure
+sqlite3 data/lean-agent.db "select label || '|' || date || '|' || timezone from energy_days;"
+sqlite3 data/lean-agent.db "select id || '|' || title || '|' || effort || '|' || priority || '|' || ifnull(deadline_at,'') || '|' || ifnull(deadline_raw,'') || '|' || duration_minutes from tasks order by id;"
+
+bun run seed -- --energy poor_sleep --tasks overloaded_queue
+sqlite3 data/lean-agent.db "select label from energy_days;"
+sqlite3 data/lean-agent.db "select count(*) from tasks;"
+sqlite3 data/lean-agent.db "select title from tasks order by id limit 5;"
+```
+
+Expected checks:
+
+- seed command lists all 5 energy and 5 task scenarios
+- parser returns normalized deadline fields
+- seeding `deadline_pressure` produces 6 tasks
+- reseeding `overloaded_queue` replaces the prior dataset with 12 tasks
+
+### Bundle C: Operation Tools + Task Resolution
+
+Scope:
+
+5. Core operation tools
+   - `create_task`
+   - `fetch_tasks`
+   - `fetch_energy`
+   - `update_task`
+   - `delete_task`
+6. Task resolution tool
+   - `resolve_task`
+   - exact match
+   - partial lexical match
+   - ambiguity candidate list
+
+Verification:
+
+```bash
+bun run typecheck
+
+bun run seed -- --energy well_rested --tasks deadline_pressure
+
+bun run tools -- fetch-tasks
+bun run tools -- fetch-energy
+
+bun run tools -- resolve-task --query "investor memo"
+bun run tools -- resolve-task --query "schedule"
+
+bun run tools -- create-task --title "Write the report" --effort medium --priority high --duration 90 --deadline "tomorrow at 4pm" --category deep_work
+sqlite3 data/lean-agent.db "select id, title, deadline_at from tasks order by id;"
+
+bun run tools -- resolve-task --query "report"
+bun run tools -- update-task --id 43 --status done --priority critical
+sqlite3 data/lean-agent.db "select id, title, status, priority from tasks where id = 43;"
+
+bun run tools -- fetch-tasks
+
+bun run tools -- delete-task --id 43
+sqlite3 data/lean-agent.db "select count(*) from tasks where id = 43;"
+```
+
+Expected checks:
+
+- read tools return current seeded state
+- create persists a new task with normalized deadline fields
+- resolve finds real task references
+- update persists status/priority changes
+- default fetch excludes `done` tasks
+- delete removes the row from SQLite
+
+### Bundle D: Skills + Subagent Wrappers
+
+Scope:
+
+7. Skill discovery and loader
+   - scan `skills/`
+   - parse frontmatter
+   - `load_skill`
+8. Context wrappers
+   - `get_energy_context`
+   - `get_task_context`
+   - trimmed subagent payloads
+   - wrapper modes: `auto`, `local`, `live`
+     - `auto` uses Anthropic when `ANTHROPIC_API_KEY` is present, otherwise falls back to a local summarizer so the bundle remains terminal-verifiable before the full chat agent is wired
+
+Verification:
+
+- `bun run seed -- --energy well_rested --tasks deadline_pressure`
+- `bun run tools list-skills`
+- `bun run tools load-skill --name task-prioritise`
+- `bun run tools get-energy-context --hour 9 --mode local --include-payload`
+- `bun run tools get-task-context --mode local --include-payload`
+- inspect returned compact summaries
+- confirm `get_energy_context` payload includes only `label`, `date`, `timezone`, `currentHour`, `hours`
+- confirm `get_task_context` payload trims tasks to `id`, `title`, `effort`, `priority`, `durationMinutes`, `deadlineAt`, `status`
+
+### Bundle E: Main Agent + CLI
+
+Scope:
+
+9. Main agent
+   - `anthropic.beta.messages.toolRunner({ stream: true })`
+   - Zod tools
+   - tool event handling
+10. CLI shell
+   - `chat` command
+   - destructive startup seed
+   - streaming output
+   - tool/subagent log lines
+
+Verification:
+
+- run `bun run chat`
+- inspect startup prompts
+- inspect streamed output
+- inspect tool log lines like `[skill: ...]`, `[tool: ...]`, `[subagent: ...]`
+- confirm `load_skill` and operation tools are called as expected
+
+### Bundle F: Safe Mutation Flow
+
+Scope:
+
+11. Integrate `resolve_task` into conversational update/delete behavior
+   - mutate only after successful resolution
+   - ask for clarification when multiple matches exist
+
+Verification:
+
+- ask to update/delete a clearly matching task and confirm mutation succeeds
+- ask to update/delete an ambiguous task and confirm the assistant asks for clarification before mutating
+
+### Bundle G: Token Counting + Evals
+
+Scope:
+
+12. Context tracking + compaction
+   - preflight `countTokens()`
+   - compaction threshold
+   - summary preservation rules
+13. Eval harness
+   - skill routing
+   - task resolution safety
+   - output quality
+   - context compaction
+
+Verification:
+
+- trigger a long enough session to force compaction
+- inspect `[context: ...]` and compaction log lines
+- confirm scenario state and task mutations survive compaction
+- run each eval individually
+- run the full eval suite
+
+### Bundle H: Error Handling + Polish
+
+Scope:
+
+14. Error handling and demo polish
+   - malformed tool input handling
+   - API failure handling
+   - empty-state handling
+   - final demo walkthrough
+
+Verification:
+
+- intentionally trigger invalid inputs from terminal
+- confirm failures are controlled and legible
+- run the full demo path end to end
+
+## Commit Plan
+
+Commit each bundle immediately after verification. Current commit pattern:
+
+- `bundle-a: bootstrap bun runtime and database foundation`
+- `bundle-b: add deterministic seed data and deadline parsing`
+- `bundle-c: add task and energy operation tools`
+
+Continue the same pattern for later bundles:
+
+- `bundle-d: add skill loading and subagent wrappers`
+- `bundle-e: add main agent and chat cli`
+- `bundle-f: add safe conversational mutation flow`
+- `bundle-g: add context compaction and eval harness`
+- `bundle-h: add error handling and polish`

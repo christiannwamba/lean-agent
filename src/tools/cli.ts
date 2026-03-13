@@ -1,6 +1,9 @@
 import { Command } from 'commander';
 
 import { DEFAULT_REFERENCE_ISO, DEFAULT_TIMEZONE } from '../dates.js';
+import { discoverSkills, loadSkill } from '../skills.js';
+import { currentHourFromReference, getEnergyContext } from '../subagents/energy-context.js';
+import { getTaskContext } from '../subagents/task-context.js';
 import { createTask } from './task-create.js';
 import { deleteTask } from './task-delete.js';
 import { fetchEnergy } from './energy-fetch.js';
@@ -11,6 +14,19 @@ import { updateTask } from './task-update.js';
 const program = new Command();
 
 program.name('tools-cli');
+
+program
+  .command('list-skills')
+  .action(() => {
+    console.log(JSON.stringify(discoverSkills(), null, 2));
+  });
+
+program
+  .command('load-skill')
+  .requiredOption('--name <name>', 'Skill name')
+  .action((options: { name: string }) => {
+    console.log(JSON.stringify(loadSkill(options.name), null, 2));
+  });
 
 program
   .command('fetch-tasks')
@@ -24,6 +40,68 @@ program
   .option('--label <label>', 'Scenario label')
   .action((options: { label?: string }) => {
     console.log(JSON.stringify(fetchEnergy(options), null, 2));
+  });
+
+program
+  .command('get-energy-context')
+  .option('--hour <hour>', 'Current hour 0-23')
+  .option('--label <label>', 'Scenario label')
+  .option('--ref <iso>', 'Reference instant', DEFAULT_REFERENCE_ISO)
+  .option('--tz <timezone>', 'IANA timezone', DEFAULT_TIMEZONE)
+  .option('--mode <mode>', 'auto | local | live', 'auto')
+  .option('--include-payload', 'Include trimmed payload in the output')
+  .action(async (options) => {
+    const currentHour =
+      options.hour !== undefined ? Number(options.hour) : currentHourFromReference(options.ref, options.tz);
+    const result = await getEnergyContext({
+      currentHour,
+      label: options.label,
+      mode: options.mode,
+    });
+
+    if (!options.includePayload) {
+      console.log(
+        JSON.stringify(
+          {
+            mode: result.mode,
+            summary: result.summary,
+          },
+          null,
+          2,
+        ),
+      );
+      return;
+    }
+
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command('get-task-context')
+  .option('--ref <iso>', 'Reference instant', DEFAULT_REFERENCE_ISO)
+  .option('--mode <mode>', 'auto | local | live', 'auto')
+  .option('--include-payload', 'Include trimmed payload in the output')
+  .action(async (options) => {
+    const result = await getTaskContext({
+      referenceInstant: options.ref,
+      mode: options.mode,
+    });
+
+    if (!options.includePayload) {
+      console.log(
+        JSON.stringify(
+          {
+            mode: result.mode,
+            summary: result.summary,
+          },
+          null,
+          2,
+        ),
+      );
+      return;
+    }
+
+    console.log(JSON.stringify(result, null, 2));
   });
 
 program

@@ -18,7 +18,7 @@ type TaskScenarioInput = Omit<NewTask, 'deadlineAt' | 'deadlineTimezone' | 'dead
   deadlineRaw?: string;
 };
 
-const energyScenarios: Record<string, EnergyScenario> = {
+export const energyScenarios: Record<string, EnergyScenario> = {
   well_rested: {
     label: 'well_rested',
     hours: [0.1, 0.1, 0.1, 0.1, 0.1, 0.2, 0.4, 0.6, 0.75, 0.88, 0.92, 0.85, 0.65, 0.45, 0.5, 0.62, 0.55, 0.45, 0.35, 0.25, 0.2, 0.15, 0.1, 0.1],
@@ -41,7 +41,7 @@ const energyScenarios: Record<string, EnergyScenario> = {
   },
 };
 
-const taskScenarios: Record<string, TaskScenarioInput[]> = {
+export const taskScenarios: Record<string, TaskScenarioInput[]> = {
   deadline_pressure: [
     { title: 'Finalize investor memo', effort: 'high', priority: 'critical', deadlineRaw: 'tomorrow at 9am', durationMinutes: 180, status: 'todo', category: 'deep_work' },
     { title: 'Ship analytics narrative', effort: 'high', priority: 'high', deadlineRaw: 'tomorrow at 10:30am', durationMinutes: 150, status: 'todo', category: 'deep_work' },
@@ -163,6 +163,14 @@ function printScenarioList(): void {
   );
 }
 
+export function getEnergyScenarioLabels(): string[] {
+  return Object.keys(energyScenarios);
+}
+
+export function getTaskScenarioLabels(): string[] {
+  return Object.keys(taskScenarios);
+}
+
 const program = new Command();
 
 program
@@ -204,4 +212,6 @@ program
     );
   });
 
-await program.parseAsync(process.argv);
+if (import.meta.main) {
+  await program.parseAsync(process.argv);
+}

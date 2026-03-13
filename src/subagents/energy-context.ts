@@ -12,7 +12,6 @@ export type EnergyContextInput = {
 };
 
 export type EnergyContextPayload = {
-  label: string;
   date: string;
   timezone: string;
   currentHour: number;
@@ -91,7 +90,6 @@ function findNextRebound(hours: number[], startHour: number): WindowMatch | null
 
 function buildPayload(day: EnergyDay, currentHour: number): EnergyContextPayload {
   return {
-    label: day.label,
     date: day.date,
     timezone: day.timezone,
     currentHour,

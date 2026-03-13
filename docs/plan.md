@@ -4,16 +4,17 @@
 
 | Layer | Tool | Why |
 |-------|------|-----|
-| Runtime | `Node.js 20+` | Required by current `better-sqlite3`. Pin in `package.json` `engines` to avoid install drift. |
-| LLM | `@anthropic-ai/sdk` | Direct SDK. Use `anthropic.beta.messages.toolRunner({ stream: true })` for streamed typed tool execution, `betaZodTool` for typed tools, and `beta.messages.countTokens()` for real preflight budget tracking. |
-| Database | `better-sqlite3` + `drizzle-orm` | Synchronous SQLite. `drizzle-kit push` for schema sync — no migration files for a demo. |
+| Runtime | `Bun` | Bun-first CLI runtime with native SQLite support and fast local execution. |
+| LLM | `@anthropic-ai/sdk` | Direct SDK. Use `anthropic.beta.messages.toolRunner({ stream: true })` for tool execution and `beta.messages.countTokens()` for real preflight budget tracking. |
+| Database | `bun:sqlite` + `drizzle-orm/bun-sqlite` | Clean Bun-native SQLite path for a local demo. |
 | Date parsing | `chrono-node` | Parse natural-language deadlines into normalized timestamps for urgency bucketing and scheduling. |
-| CLI input | Node `readline` | Built-in. Handles prompt, history, line events. No framework overhead. |
-| CLI output | `chalk` | Colored log lines, styled output. Streaming via raw `process.stdout.write()`. |
+| Scenario picker | `@clack/prompts` | Minimal, modern terminal UI for polished scenario selection and startup choices. |
+| Chat input | Node `readline` | Simple prompt loop for ongoing message entry once chat starts. |
+| CLI output | `chalk` + `cli-markdown` | Colored log lines plus terminal-friendly rendering for assistant Markdown. |
 | CLI commands | `commander` | Zero-dependency arg parser. Subcommands for `chat`, `seed`. Flags for `--hour`, `--energy`. |
 | Spinner | `ora` | Loading state between user input and first token. |
 | Evals | `vitest-evals` | Vitest-native eval runner from Sentry. Use custom Anthropic-based scorers so eval infra matches the runtime provider. |
-| Validation | `zod` | Schema validation for tool inputs. Also powers `betaZodTool` and type derivation. |
+| Validation | `zod` | Schema validation for tool inputs and type derivation; convert to JSON Schema before handing tools to the SDK in this Zod 3 stack. |
 
 ---
 
@@ -236,7 +237,7 @@ The point of these subagents is deliberate context compression. As task volume g
 - **System prompt:** "You are an energy curve analyst. Return a compact summary: current level, next peak (time range), next dip (time range), next rebound (time range). Max 60 tokens."
 - **Output:** ~60 token structured summary
 - **Context isolation:** Separate API call. Only the summary string enters the main agent's context.
-- **Pre-trim step:** The wrapper sends only the 24-value curve, scenario label, timezone, and current hour. No chat history is forwarded.
+- **Pre-trim step:** The wrapper sends only the 24-value curve, date, timezone, and current hour. No scenario labels or chat history are forwarded.
 
 ### Task subagent (`get_task_context`)
 
@@ -280,7 +281,7 @@ When the preflight count crosses 8,000 tokens, a dedicated compaction call fires
 ```typescript
 async function compact(messages: MessageParam[]): Promise<MessageParam[]> {
   const summary = await client.messages.create({
-    model: 'claude-sonnet-4-5-20250929',
+    model: 'claude-sonnet-4-6',
     max_tokens: 500,
     system: `Compress this conversation history into a structured summary.
 Preserve verbatim:
@@ -487,7 +488,7 @@ The `prioritisationJudge` is a custom scorer that calls Claude as a grader:
 ```typescript
 async function prioritisationJudge({ input, output }) {
   const response = await client.messages.create({
-    model: 'claude-sonnet-4-5-20250929',
+      model: 'claude-sonnet-4-6',
     max_tokens: 300,
     system: `You are an eval grader. Score the following prioritisation output 1-5.
 Criteria:
@@ -707,7 +708,7 @@ Verification:
 - `bun run tools get-energy-context --hour 9 --mode local --include-payload`
 - `bun run tools get-task-context --mode local --include-payload`
 - inspect returned compact summaries
-- confirm `get_energy_context` payload includes only `label`, `date`, `timezone`, `currentHour`, `hours`
+- confirm `get_energy_context` payload includes only `date`, `timezone`, `currentHour`, `hours`
 - confirm `get_task_context` payload trims tasks to `id`, `title`, `effort`, `priority`, `durationMinutes`, `deadlineAt`, `status`
 
 ### Bundle E: Main Agent + CLI
@@ -716,21 +717,30 @@ Scope:
 
 9. Main agent
    - `anthropic.beta.messages.toolRunner({ stream: true })`
-   - Zod tools
+   - Zod-authored tool schemas
+     - in this Bun/Zod 3 stack, keep Zod as the source of truth but convert schemas through a helper before passing them to the SDK tool runner; the SDK's `betaZodTool` expects Zod 4's `z.toJSONSchema()`
+   - do not inject active seed labels into the system prompt; the agent should reason from time, tools, and returned data instead
    - tool event handling
 10. CLI shell
    - `chat` command
    - destructive startup seed
-   - streaming output
+   - token count display after each turn
+   - rich scenario picker for energy/tasks
+   - default to the current local hour unless `--hour` is explicitly provided
+   - loading spinner while waiting for the full assistant response
+   - terminal-friendly Markdown rendering for assistant output
    - tool/subagent log lines
 
 Verification:
 
-- run `bun run chat`
-- inspect startup prompts
-- inspect streamed output
+- `bun run typecheck`
+- `bun run chat --help`
+- `printf "%s\n%s\n" "show me my tasks" "quit" | bun run chat --energy well_rested --tasks deadline_pressure --hour 9`
+- `printf "%s\n%s\n" "how's my energy right now?" "quit" | bun run chat --energy well_rested --tasks deadline_pressure --hour 9`
+- inspect startup output, richer picker UX, rendered assistant output, and `[context: ...]` token display
 - inspect tool log lines like `[skill: ...]`, `[tool: ...]`, `[subagent: ...]`
-- confirm `load_skill` and operation tools are called as expected
+- confirm `load_skill` and the expected operation/context tools are called
+- run these verification chats sequentially, not in parallel, because startup reseeds the same SQLite database and parallel runs can hit `SQLITE_BUSY`
 
 ### Bundle F: Safe Mutation Flow
 
@@ -745,25 +755,38 @@ Verification:
 - ask to update/delete a clearly matching task and confirm mutation succeeds
 - ask to update/delete an ambiguous task and confirm the assistant asks for clarification before mutating
 
-### Bundle G: Token Counting + Evals
+### Verification Plan
 
-Scope:
+Token and context tests:
 
-12. Context tracking + compaction
-   - preflight `countTokens()`
-   - compaction threshold
-   - summary preservation rules
-13. Eval harness
-   - skill routing
-   - task resolution safety
-   - output quality
-   - context compaction
+- add deterministic tests for token-budget plumbing using the exact request shape sent to Anthropic
+- assert that the chat UI displays `[context: X / 10,000 tokens]`
+- add a threshold test that forces the tracked context over 8,000 tokens and verifies compaction is triggered before the next main-agent turn
+- assert that compaction preserves:
+  - task mutations from the session
+  - explicit user preferences
+  - unresolved task references
+
+Skill-scoping tests:
+
+- add a deterministic test proving `load_skill` instructions are turn-scoped
+- assert that skill instructions are available in the current request only
+- assert that the next turn does not retain prior skill text in history unless the model loads the skill again
+
+Agent evals:
+
+- skill routing
+- task resolution safety
+- output quality
+- context compaction
 
 Verification:
 
 - trigger a long enough session to force compaction
 - inspect `[context: ...]` and compaction log lines
 - confirm scenario state and task mutations survive compaction
+- run the turn-scoped skill test
+- run the token-budget tests
 - run each eval individually
 - run the full eval suite
 
@@ -796,5 +819,4 @@ Continue the same pattern for later bundles:
 - `bundle-d: add skill loading and subagent wrappers`
 - `bundle-e: add main agent and chat cli`
 - `bundle-f: add safe conversational mutation flow`
-- `bundle-g: add context compaction and eval harness`
 - `bundle-h: add error handling and polish`

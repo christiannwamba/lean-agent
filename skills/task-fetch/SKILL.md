@@ -9,7 +9,7 @@ Use this skill when the user wants to see their current tasks without asking for
 
 ## Workflow
 
-1. Call `fetch_tasks`.
+1. Call `get_task_list`.
 2. Group open tasks by priority.
 3. Present deadlines, effort, and duration clearly.
 

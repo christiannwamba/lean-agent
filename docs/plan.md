@@ -12,7 +12,7 @@
 | Chat input | Node `readline` | Simple prompt loop for ongoing message entry once chat starts. |
 | CLI output | `chalk` + `cli-markdown` | Colored log lines plus terminal-friendly rendering for assistant Markdown. |
 | CLI commands | `commander` | Zero-dependency arg parser. Subcommands for `chat`, `seed`. Flags for `--hour`, `--energy`. |
-| Spinner | `ora` | Loading state between user input and first token. |
+| Spinner | `@clack/prompts` spinner | Loading state while the assistant turn is in progress. |
 | Evals | `vitest-evals` | Vitest-native eval runner from Sentry. Use custom Anthropic-based scorers so eval infra matches the runtime provider. |
 | Validation | `zod` | Schema validation for tool inputs and type derivation; convert to JSON Schema before handing tools to the SDK in this Zod 3 stack. |
 
@@ -29,15 +29,18 @@ lean-agent/
 │   ├── context.ts               # Token tracking, compaction logic
 │   ├── dates.ts                 # Deadline parsing + ISO normalization helpers
 │   ├── skills.ts                # Skill discovery + loadSkill tool
+│   ├── subagents/
+│   │   ├── anthropic.ts         # Shared Anthropic client + model defaults
+│   │   ├── energy-context.ts    # Energy subagent tool — compact curve summary
+│   │   ├── task-context.ts      # Task subagent tool — compact urgency/effort grouping
+│   │   └── task-list.ts         # Task-list subagent tool — concise user-facing list
 │   ├── tools/
 │   │   ├── task-create.ts       # Insert task row
 │   │   ├── task-resolve.ts      # Find a task by natural-language reference
 │   │   ├── task-update.ts       # Update task row
-│   │   ├── task-delete.ts       # Delete task row
-│   │   ├── task-fetch.ts        # Query open tasks
-│   │   ├── energy-fetch.ts      # Read energy array from DB
-│   │   ├── energy-context.ts    # Energy subagent tool — compact curve summary
-│   │   └── task-context.ts      # Task subagent tool — compact urgency/effort grouping
+│   │   ├── task-delete.ts       # Update task row
+│   │   ├── task-fetch.ts        # Internal task query helper
+│   │   └── energy-fetch.ts      # Internal energy query helper
 │   └── db/
 │       ├── index.ts             # Database connection
 │       ├── schema.ts            # Drizzle table definitions
@@ -191,7 +194,7 @@ Each `SKILL.md` contains the full reasoning chain, rules, and output format from
 
 ## Tools
 
-Nine tools total: one meta-tool (`load_skill`), six operation tools, two context tools (subagents).
+Seven tools total: one meta-tool (`load_skill`), four mutation tools, three subagent read tools.
 
 ### Operation tools (always available)
 
@@ -201,8 +204,6 @@ Nine tools total: one meta-tool (`load_skill`), six operation tools, two context
 | `resolve_task` | `{ query, include_done? }` | Match a natural-language task reference to candidate rows. Returns exact match or a short candidate list for confirmation. |
 | `update_task` | `{ id, fields: Partial<Task> }` | Update row. Returns updated task. |
 | `delete_task` | `{ id }` | Delete row. Returns confirmation. |
-| `fetch_tasks` | `{ status?: string }` | Query tasks. Defaults to non-done. Returns task list. |
-| `fetch_energy` | `{ label?: string }` | Query energy scenario. Defaults to today's. Returns the 24-hour array + metadata. |
 
 ### Context tools (subagents)
 
@@ -210,8 +211,9 @@ Nine tools total: one meta-tool (`load_skill`), six operation tools, two context
 |------|-------|--------|
 | `get_energy_context` | `{ current_hour: number }` | Runs the energy subagent. Returns a compact summary (~60 tokens) of current level, next peak, next dip, next rebound. |
 | `get_task_context` | `{}` | Runs the task subagent. Returns a compact summary (~80 tokens) grouping open tasks by deadline urgency and effort. |
+| `get_task_list` | `{ status?: string }` | Runs the task-list subagent. Returns a concise user-facing Markdown list grouped for display. |
 
-These are general-purpose context tools, not tied to any single skill. Claude calls them whenever it needs situational awareness — before prioritising, before creating a task (to know where it fits in the schedule), before deleting (to see what can be reshuffled), before updating (to reason about knock-on effects).
+These are general-purpose read tools, not tied to any single skill. Claude uses them for all read access. Raw database fetch helpers stay internal to the app and are never exposed to the main agent.
 
 Each tool wraps a standalone `client.messages.create()` call internally. The main agent never sees the subagent's full context — only the compact summary returned as a `tool_result`.
 
@@ -227,7 +229,7 @@ Each tool wraps a standalone `client.messages.create()` call internally. The mai
 
 ## Subagents
 
-Two subagents exposed as context tools. Each is a standalone `client.messages.create()` call with its own system prompt and constrained output. The main agent calls them whenever it needs situational awareness — not just for prioritisation.
+Three subagents exposed as tools. Each is a standalone `client.messages.create()` call with its own system prompt and constrained output. The main agent calls them whenever it needs situational awareness or display-ready read access.
 
 The point of these subagents is deliberate context compression. As task volume grows, passing the raw task table or verbose energy reasoning into the main agent becomes noisy. Each subagent fetches narrow structured data, cleans it up, summarizes only decision-relevant points, and returns a bounded result to the main agent.
 
@@ -247,9 +249,18 @@ The point of these subagents is deliberate context compression. As task volume g
 - **Context isolation:** Same as above.
 - **Pre-trim step:** The wrapper strips unused columns and excludes done tasks before the subagent call.
 
+### Task-list subagent (`get_task_list`)
+
+- **Input:** Open task list only, trimmed to `id`, `title`, `effort`, `priority`, `duration_minutes`, `deadline_at`, `status`
+- **System prompt:** "You are a task list formatter. Return a concise, user-facing markdown list of tasks grouped by priority. Include id, title, effort, duration, and deadline when present. Exclude any analysis beyond a one-line count summary."
+- **Output:** concise Markdown list suitable for terminal rendering
+- **Context isolation:** Same as above.
+- **Pre-trim step:** The wrapper strips unused columns and excludes done tasks by default before the subagent call.
+
 ### When Claude calls them
 
 - **Prioritising:** Calls both in sequence, reasons across the two summaries.
+- **Task listing:** Calls `get_task_list` so the main agent never sees raw task rows.
 - **Creating a task:** Calls both to understand where the new task fits in the day's schedule and energy curve. Can suggest optimal timing.
 - **Updating a task:** Calls `get_task_context` to see the current landscape, may call `get_energy_context` if the change affects scheduling (e.g., bumping effort from low to high).
 - **Deleting a task:** Calls `get_task_context` to see what opens up. May recommend reshuffling remaining tasks into freed windows.
@@ -640,8 +651,6 @@ Scope:
 
 5. Core operation tools
    - `create_task`
-   - `fetch_tasks`
-   - `fetch_energy`
    - `update_task`
    - `delete_task`
 6. Task resolution tool
@@ -678,7 +687,7 @@ sqlite3 data/lean-agent.db "select count(*) from tasks where id = 43;"
 
 Expected checks:
 
-- read tools return current seeded state
+- internal fetch helpers return current seeded state
 - create persists a new task with normalized deadline fields
 - resolve finds real task references
 - update persists status/priority changes
@@ -696,20 +705,22 @@ Scope:
 8. Context wrappers
    - `get_energy_context`
    - `get_task_context`
+   - `get_task_list`
    - trimmed subagent payloads
-   - wrapper modes: `auto`, `local`, `live`
-     - `auto` uses Anthropic when `ANTHROPIC_API_KEY` is present, otherwise falls back to a local summarizer so the bundle remains terminal-verifiable before the full chat agent is wired
+   - Anthropic-backed only; no local summarizer branch
 
 Verification:
 
 - `bun run seed -- --energy well_rested --tasks deadline_pressure`
 - `bun run tools list-skills`
 - `bun run tools load-skill --name task-prioritise`
-- `bun run tools get-energy-context --hour 9 --mode local --include-payload`
-- `bun run tools get-task-context --mode local --include-payload`
+- `bun run tools get-energy-context --hour 9 --include-payload`
+- `bun run tools get-task-context --include-payload`
+- `bun run tools get-task-list --include-payload`
 - inspect returned compact summaries
 - confirm `get_energy_context` payload includes only `date`, `timezone`, `currentHour`, `hours`
 - confirm `get_task_context` payload trims tasks to `id`, `title`, `effort`, `priority`, `durationMinutes`, `deadlineAt`, `status`
+- confirm `get_task_list` payload trims tasks to `id`, `title`, `effort`, `priority`, `durationMinutes`, `deadlineAt`, `status`
 
 ### Bundle E: Main Agent + CLI
 
@@ -728,6 +739,7 @@ Scope:
    - rich scenario picker for energy/tasks
    - default to the current local hour unless `--hour` is explicitly provided
    - loading spinner while waiting for the full assistant response
+   - print `[skill: ...]`, `[tool: ...]`, and `[subagent: ...]` immediately when those events occur; stop the spinner on the first such event so the user sees tool activity before the final rendered Markdown response
    - terminal-friendly Markdown rendering for assistant output
    - tool/subagent log lines
 
@@ -749,6 +761,7 @@ Scope:
 11. Integrate `resolve_task` into conversational update/delete behavior
    - mutate only after successful resolution
    - ask for clarification when multiple matches exist
+   - enforce a turn-local mutation guard so `update_task` and `delete_task` are blocked unless `resolve_task` returned one exact task in that same turn
 
 Verification:
 

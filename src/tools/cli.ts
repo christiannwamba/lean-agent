@@ -4,6 +4,7 @@ import { DEFAULT_REFERENCE_ISO, DEFAULT_TIMEZONE } from '../dates.js';
 import { discoverSkills, loadSkill } from '../skills.js';
 import { currentHourFromReference, getEnergyContext } from '../subagents/energy-context.js';
 import { getTaskContext } from '../subagents/task-context.js';
+import { getTaskList } from '../subagents/task-list.js';
 import { createTask } from './task-create.js';
 import { deleteTask } from './task-delete.js';
 import { fetchEnergy } from './energy-fetch.js';
@@ -48,7 +49,6 @@ program
   .option('--label <label>', 'Scenario label')
   .option('--ref <iso>', 'Reference instant', DEFAULT_REFERENCE_ISO)
   .option('--tz <timezone>', 'IANA timezone', DEFAULT_TIMEZONE)
-  .option('--mode <mode>', 'auto | local | live', 'auto')
   .option('--include-payload', 'Include trimmed payload in the output')
   .action(async (options) => {
     const currentHour =
@@ -56,20 +56,10 @@ program
     const result = await getEnergyContext({
       currentHour,
       label: options.label,
-      mode: options.mode,
     });
 
     if (!options.includePayload) {
-      console.log(
-        JSON.stringify(
-          {
-            mode: result.mode,
-            summary: result.summary,
-          },
-          null,
-          2,
-        ),
-      );
+      console.log(JSON.stringify({ summary: result.summary }, null, 2));
       return;
     }
 
@@ -79,25 +69,31 @@ program
 program
   .command('get-task-context')
   .option('--ref <iso>', 'Reference instant', DEFAULT_REFERENCE_ISO)
-  .option('--mode <mode>', 'auto | local | live', 'auto')
   .option('--include-payload', 'Include trimmed payload in the output')
   .action(async (options) => {
     const result = await getTaskContext({
       referenceInstant: options.ref,
-      mode: options.mode,
     });
 
     if (!options.includePayload) {
-      console.log(
-        JSON.stringify(
-          {
-            mode: result.mode,
-            summary: result.summary,
-          },
-          null,
-          2,
-        ),
-      );
+      console.log(JSON.stringify({ summary: result.summary }, null, 2));
+      return;
+    }
+
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command('get-task-list')
+  .option('--status <status>', 'todo | in_progress | done')
+  .option('--include-payload', 'Include trimmed payload in the output')
+  .action(async (options: { status?: 'todo' | 'in_progress' | 'done'; includePayload?: boolean }) => {
+    const result = await getTaskList({
+      status: options.status,
+    });
+
+    if (!options.includePayload) {
+      console.log(JSON.stringify({ summary: result.summary }, null, 2));
       return;
     }
 

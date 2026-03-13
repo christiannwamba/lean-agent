@@ -1,7 +1,7 @@
 import { Command } from 'commander';
-import { cancel, intro, isCancel, outro, select, spinner } from '@clack/prompts';
+import { cancel, intro, isCancel, outro, select, spinner, text } from '@clack/prompts';
 import type Anthropic from '@anthropic-ai/sdk';
-import { createInterface } from 'node:readline/promises';
+import chalk from 'chalk';
 import process from 'node:process';
 
 import { DEFAULT_REFERENCE_ISO, DEFAULT_TIMEZONE } from './dates.js';
@@ -99,26 +99,20 @@ async function runChat(options: ChatOptions): Promise<void> {
   intro('lean-agent');
   console.log(`Seeded demo with energy=${config.energyLabel}, tasks=${config.taskLabel}, hour=${config.currentHour}, tz=${config.timezone}`);
   console.log('Type `exit` or `quit` to end the session.');
-
-  const rl = createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
-
   let history: Anthropic.Beta.Messages.BetaMessageParam[] = [];
 
   try {
     while (true) {
-      let input = '';
-      try {
-        input = (await rl.question('> ')).trim();
-      } catch (error) {
-        if (error instanceof Error && 'code' in error && error.code === 'ERR_USE_AFTER_CLOSE') {
-          break;
-        }
+      const response = await text({
+        message: '>',
+        placeholder: 'Ask about tasks, energy, or scheduling',
+      });
 
-        throw error;
+      if (isCancel(response)) {
+        break;
       }
+
+      const input = response.trim();
 
       if (!input) {
         continue;
@@ -128,9 +122,38 @@ async function runChat(options: ChatOptions): Promise<void> {
         break;
       }
 
-      const logger = createTerminalLogger();
       const loading = spinner();
-      loading.start('Thinking...');
+      let loadingActive = false;
+      const stopLoading = () => {
+        if (!loadingActive) {
+          return;
+        }
+
+        loadingActive = false;
+        loading.stop('');
+      };
+      const clearLoading = () => {
+        if (!loadingActive) {
+          return;
+        }
+
+        loadingActive = false;
+        loading.clear();
+      };
+      const startLoading = (message = 'Thinking...') => {
+        if (loadingActive) {
+          return;
+        }
+
+        loadingActive = true;
+        loading.start(message);
+      };
+      const logger = createTerminalLogger({
+        immediate: true,
+        beforeEachLog: clearLoading,
+        afterEachLog: () => startLoading('Waiting...'),
+      });
+      startLoading('Thinking...');
 
       const result = await runChatTurn({
         config,
@@ -139,10 +162,9 @@ async function runChat(options: ChatOptions): Promise<void> {
         logger,
       });
 
-      loading.stop('');
+      stopLoading();
 
       history = result.history as Anthropic.Beta.Messages.BetaMessageParam[];
-      logger.flush();
 
       const rendered = renderAssistantOutput(result.assistantText);
       if (rendered) {
@@ -152,11 +174,12 @@ async function runChat(options: ChatOptions): Promise<void> {
       const warning =
         result.contextTokens >= COMPACTION_THRESHOLD_TOKENS ? ' compaction-soon' : '';
       console.log(
-        `[context: ${result.contextTokens.toLocaleString()} / ${MAX_CONTEXT_TOKENS.toLocaleString()} tokens${warning}]`,
+        chalk.dim(
+          `[context: ${result.contextTokens.toLocaleString()} / ${MAX_CONTEXT_TOKENS.toLocaleString()} tokens${warning}]`,
+        ),
       );
     }
   } finally {
-    rl.close();
     outro('Session ended.');
   }
 }

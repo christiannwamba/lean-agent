@@ -9,10 +9,9 @@ import { buildSkillSummary, discoverSkills, loadSkill } from "./skills.js";
 import { getAnthropicClient } from "./subagents/anthropic.js";
 import { getEnergyContext } from "./subagents/energy-context.js";
 import { getTaskContext } from "./subagents/task-context.js";
+import { getTaskList } from "./subagents/task-list.js";
 import { createTask } from "./tools/task-create.js";
 import { deleteTask } from "./tools/task-delete.js";
-import { fetchEnergy } from "./tools/energy-fetch.js";
-import { fetchTasks } from "./tools/task-fetch.js";
 import { resolveTask } from "./tools/task-resolve.js";
 import { updateTask } from "./tools/task-update.js";
 
@@ -24,6 +23,12 @@ type AgentLogger = {
 
 export type TerminalLogger = AgentLogger & {
   flush(): void;
+};
+
+type TerminalLoggerOptions = {
+  immediate?: boolean;
+  beforeEachLog?: () => void;
+  afterEachLog?: () => void;
 };
 
 export const MAX_CONTEXT_TOKENS = 10_000;
@@ -113,16 +118,12 @@ function formatSessionContext(config: ChatSessionConfig): string {
   ].join("\n");
 }
 
-function sanitizeEnergyResult(result: ReturnType<typeof fetchEnergy>) {
-  if (!result) {
-    return null;
-  }
-
-  return {
-    date: result.date,
-    timezone: result.timezone,
-    hours: result.hours,
-  };
+function extractAssistantText(message: Anthropic.Beta.Messages.BetaMessage): string {
+  return message.content
+    .filter((block): block is Anthropic.Beta.Messages.BetaTextBlock => block.type === "text")
+    .map((block) => block.text)
+    .join("\n")
+    .trim();
 }
 
 function buildSystemPrompt(config: ChatSessionConfig): string {
@@ -132,8 +133,10 @@ function buildSystemPrompt(config: ChatSessionConfig): string {
     "You are a task-planning CLI assistant for a throwaway demo.",
     "Be concise, practical, and explicit about scheduling tradeoffs.",
     "Before acting on a task or energy request, load the relevant skill with `load_skill`.",
-    "Use `resolve_task` before any update or delete when the user names a task naturally.",
-    "Use `get_energy_context` and `get_task_context` whenever situational awareness would improve the answer.",
+    "Use `resolve_task` before any update or delete.",
+    "If `resolve_task` returns multiple candidates or none, ask a short clarification question and do not mutate anything.",
+    "Only call `update_task` or `delete_task` after `resolve_task` returns one exact task in the current turn.",
+    "Use `get_energy_context`, `get_task_context`, and `get_task_list` for read access. Do not expect raw database fetch tools.",
     "Never invent database state. Use tools.",
     formatSessionContext(config),
     buildSkillSummary(skills),
@@ -141,6 +144,8 @@ function buildSystemPrompt(config: ChatSessionConfig): string {
 }
 
 export function buildTools(config: ChatSessionConfig, logger: AgentLogger) {
+  const resolvedTaskIds = new Set<number>();
+
   return [
     zodTool({
       name: "load_skill",
@@ -183,7 +188,12 @@ export function buildTools(config: ChatSessionConfig, logger: AgentLogger) {
       }),
       run: ({ query, includeDone, limit }) => {
         logger.log("tool", "resolve_task");
-        return json(resolveTask({ query, includeDone, limit }));
+        const result = resolveTask({ query, includeDone, limit });
+        if (result.type === "exact") {
+          resolvedTaskIds.add(result.task.id);
+        }
+
+        return json(result);
       },
     }),
     zodTool({
@@ -196,6 +206,12 @@ export function buildTools(config: ChatSessionConfig, logger: AgentLogger) {
       }),
       run: ({ id, fields }) => {
         logger.log("tool", "update_task");
+        if (!resolvedTaskIds.has(id)) {
+          throw new Error(
+            "update_task is blocked until resolve_task returns one exact task in the current turn",
+          );
+        }
+
         return json(
           updateTask({
             id,
@@ -216,30 +232,13 @@ export function buildTools(config: ChatSessionConfig, logger: AgentLogger) {
       }),
       run: ({ id }) => {
         logger.log("tool", "delete_task");
+        if (!resolvedTaskIds.has(id)) {
+          throw new Error(
+            "delete_task is blocked until resolve_task returns one exact task in the current turn",
+          );
+        }
+
         return json(deleteTask(id));
-      },
-    }),
-    zodTool({
-      name: "fetch_tasks",
-      description:
-        "Fetch tasks from the database. Defaults to open tasks only.",
-      inputSchema: z.object({
-        status: z.enum(["todo", "in_progress", "done"]).optional(),
-      }),
-      run: ({ status }) => {
-        logger.log("tool", "fetch_tasks");
-        return json(fetchTasks({ status }));
-      },
-    }),
-    zodTool({
-      name: "fetch_energy",
-      description: "Fetch the active energy scenario and its 24-hour curve.",
-      inputSchema: z.object({
-        label: z.string().optional(),
-      }),
-      run: ({ label }) => {
-        logger.log("tool", "fetch_energy");
-        return json(sanitizeEnergyResult(fetchEnergy({ label })));
       },
     }),
     zodTool({
@@ -255,7 +254,6 @@ export function buildTools(config: ChatSessionConfig, logger: AgentLogger) {
         const result = await getEnergyContext({
           currentHour: currentHour ?? config.currentHour,
           label,
-          mode: "auto",
         });
         return result.summary;
       },
@@ -268,9 +266,21 @@ export function buildTools(config: ChatSessionConfig, logger: AgentLogger) {
       run: async () => {
         logger.log("subagent", "tasks");
         const result = await getTaskContext({
-          mode: "auto",
           referenceInstant: config.referenceInstant ?? DEFAULT_REFERENCE_ISO,
         });
+        return result.summary;
+      },
+    }),
+    zodTool({
+      name: "get_task_list",
+      description:
+        "Return a concise markdown task list grouped for display. Use this when the user wants to see their tasks.",
+      inputSchema: z.object({
+        status: z.enum(["todo", "in_progress", "done"]).optional(),
+      }),
+      run: async ({ status }) => {
+        logger.log("subagent", "task-list");
+        const result = await getTaskList({ status });
         return result.summary;
       },
     }),
@@ -316,12 +326,13 @@ export async function runChatTurn(
   params: ChatTurnParams,
 ): Promise<ChatTurnResult> {
   const client = getAnthropicClient();
+  const userMessage: Anthropic.Beta.Messages.BetaMessageParam = {
+    role: "user",
+    content: params.userInput,
+  };
   const messages: Anthropic.Beta.Messages.BetaMessageParam[] = [
     ...params.history,
-    {
-      role: "user",
-      content: params.userInput,
-    },
+    userMessage,
   ];
 
   const runner = client.beta.messages.toolRunner(
@@ -339,8 +350,16 @@ export async function runChatTurn(
     await stream.done();
   }
 
-  await runner.done();
-  const history = structuredClone(runner.params.messages);
+  const finalMessage = await runner.done();
+  assistantText = extractAssistantText(finalMessage) || assistantText.trim();
+  const history: Anthropic.Beta.Messages.BetaMessageParam[] = [
+    ...params.history,
+    userMessage,
+    {
+      role: "assistant",
+      content: finalMessage.content,
+    },
+  ];
   const contextTokens = await countContextTokens(client, params.config, history);
 
   return {
@@ -350,22 +369,38 @@ export async function runChatTurn(
   };
 }
 
-export function createTerminalLogger(): TerminalLogger {
+function formatLogEntry(kind: LogKind, label: string): string {
+  const prefix =
+    kind === "skill"
+      ? "[skill"
+      : kind === "subagent"
+        ? "[subagent"
+        : "[tool";
+
+  return chalk.dim(`${prefix}: ${label}]`);
+}
+
+export function createTerminalLogger(
+  options: TerminalLoggerOptions = {},
+): TerminalLogger {
   const entries: string[] = [];
 
   return {
     log(kind, label) {
-      const prefix =
-        kind === "skill"
-          ? "[skill"
-          : kind === "subagent"
-            ? "[subagent"
-            : "[tool";
-      entries.push(chalk.dim(`${prefix}: ${label}]`));
+      options.beforeEachLog?.();
+
+      const entry = formatLogEntry(kind, label);
+      if (options.immediate) {
+        console.log(entry);
+        options.afterEachLog?.();
+        return;
+      }
+
+      entries.push(entry);
     },
     flush() {
       for (const entry of entries.splice(0, entries.length)) {
-        console.log(`\n${entry}`);
+        console.log(entry);
       }
     },
   };

@@ -1,14 +1,12 @@
 import type { Task } from '../db/schema.js';
-import { DEFAULT_REFERENCE_ISO } from '../dates.js';
 import { fetchTasks } from '../tools/task-fetch.js';
 import { DEFAULT_SUBAGENT_MODEL, getAnthropicClient } from './anthropic.js';
 
-export type TaskContextInput = {
-  referenceInstant?: string;
+export type TaskListInput = {
+  status?: Task['status'];
 };
 
-export type TaskContextPayload = {
-  referenceInstant: string;
+export type TaskListPayload = {
   tasks: Array<{
     id: number;
     title: string;
@@ -20,13 +18,13 @@ export type TaskContextPayload = {
   }>;
 };
 
-export type TaskContextResult = {
+export type TaskListResult = {
   summary: string;
-  payload: TaskContextPayload;
+  payload: TaskListPayload;
 };
 
-function buildPayload(referenceInstant: string): TaskContextPayload {
-  const tasks = fetchTasks().map((task) => ({
+function buildPayload(status?: Task['status']): TaskListPayload {
+  const tasks = fetchTasks(status ? { status } : {}).map((task) => ({
     id: task.id,
     title: task.title,
     effort: task.effort,
@@ -36,19 +34,16 @@ function buildPayload(referenceInstant: string): TaskContextPayload {
     status: task.status,
   }));
 
-  return {
-    referenceInstant,
-    tasks,
-  };
+  return { tasks };
 }
 
-async function summarizeTaskContext(payload: TaskContextPayload): Promise<string> {
+async function summarizeTaskList(payload: TaskListPayload): Promise<string> {
   const client = getAnthropicClient();
   const response = await client.messages.create({
     model: DEFAULT_SUBAGENT_MODEL,
-    max_tokens: 160,
+    max_tokens: 260,
     system:
-      'You are a task analyst. Group tasks by deadline urgency (overdue, within 8h, within 24h, later, no deadline) and effort level. Return a compact summary. Max 80 tokens.',
+      'You are a task list formatter. Return a concise, user-facing markdown list of tasks grouped by priority. Include id, title, effort, duration, and deadline when present. Exclude any analysis beyond a one-line count summary.',
     messages: [
       {
         role: 'user',
@@ -61,9 +56,9 @@ async function summarizeTaskContext(payload: TaskContextPayload): Promise<string
   return textBlock?.text.trim() ?? '';
 }
 
-export async function getTaskContext(input: TaskContextInput = {}): Promise<TaskContextResult> {
-  const payload = buildPayload(input.referenceInstant ?? DEFAULT_REFERENCE_ISO);
-  const summary = await summarizeTaskContext(payload);
+export async function getTaskList(input: TaskListInput = {}): Promise<TaskListResult> {
+  const payload = buildPayload(input.status);
+  const summary = await summarizeTaskList(payload);
 
   return {
     summary,

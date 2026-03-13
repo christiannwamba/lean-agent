@@ -13,6 +13,7 @@ Use this skill when the user wants to modify, complete, remove, or cancel a task
 - Always use `resolve_task` first for natural-language references.
 - If multiple tasks match, ask a short clarification question.
 - Never delete without confirming the exact task.
+- `update_task` and `delete_task` are guarded: they only work after `resolve_task` returns one exact task in the current turn.
 
 ## Workflow
 

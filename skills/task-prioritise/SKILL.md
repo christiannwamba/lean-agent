@@ -27,6 +27,7 @@ Use this skill when the user asks what to work on next or how to plan the day.
 
 ## Inputs To Gather
 
+- Use `search_tools` for the tools needed by `task-prioritise`.
 - `get_energy_context`
 - `get_task_context`
 

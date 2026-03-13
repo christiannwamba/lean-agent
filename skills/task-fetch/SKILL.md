@@ -9,9 +9,10 @@ Use this skill when the user wants to see their current tasks without asking for
 
 ## Workflow
 
-1. Call `get_task_list`.
-2. Group open tasks by priority.
-3. Present deadlines, effort, and duration clearly.
+1. Call `search_tools` for the tools needed by `task-fetch`.
+2. Call `get_task_list`.
+3. Group open tasks by priority.
+4. Present deadlines, effort, and duration clearly.
 
 ## Rules
 

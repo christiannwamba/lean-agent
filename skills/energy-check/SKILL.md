@@ -10,9 +10,10 @@ Use this skill when the user asks about their current energy, next peak, next di
 ## Workflow
 
 1. Determine the current hour.
-2. Call `get_energy_context`.
-3. Summarise the user's current level and what comes next.
-4. Give a one-line recommendation for the kind of work that fits now.
+2. Call `search_tools` for the tools needed by `energy-check`.
+3. Call `get_energy_context`.
+4. Summarise the user's current level and what comes next.
+5. Give a one-line recommendation for the kind of work that fits now.
 
 ## Output
 

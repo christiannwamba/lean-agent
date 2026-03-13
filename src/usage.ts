@@ -1,3 +1,5 @@
+import type { LanguageModelUsage } from 'ai';
+
 export type TokenUsageSummary = {
   inputTokens: number;
   outputTokens: number;
@@ -34,5 +36,19 @@ export function fromAnthropicUsage(usage?: {
     inputTokens,
     outputTokens,
     totalTokens: inputTokens + outputTokens,
+  };
+}
+
+export function fromLanguageModelUsage(
+  usage?: Partial<LanguageModelUsage>,
+): TokenUsageSummary {
+  const inputTokens = usage?.inputTokens ?? 0;
+  const outputTokens = usage?.outputTokens ?? 0;
+  const totalTokens = usage?.totalTokens ?? inputTokens + outputTokens;
+
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens,
   };
 }

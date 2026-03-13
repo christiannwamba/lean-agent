@@ -36,9 +36,10 @@ Use this skill when the user is creating a new task from natural language.
 ## Workflow
 
 1. Understand the user request and extract the task intent.
-2. Load current task and energy context if it helps place the task in the day.
-3. Call `create_task` with the parsed fields.
-4. Confirm the created task using the normalized values returned by the tool.
+2. Call `search_tools` for the tools needed by `task-create`.
+3. Load current task and energy context if it helps place the task in the day.
+4. Call `create_task` with the parsed fields.
+5. Confirm the created task using the normalized values returned by the tool.
 
 ## Output
 

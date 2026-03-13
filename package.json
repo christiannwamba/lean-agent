@@ -17,8 +17,10 @@
     "chat": "\"${BUN_BIN:-$HOME/.bun/bin/bun}\" src/chat.ts"
   },
   "dependencies": {
+    "@ai-sdk/anthropic": "^3.0.58",
     "@anthropic-ai/sdk": "^0.78.0",
     "@clack/prompts": "^1.1.0",
+    "ai": "^6.0.116",
     "chalk": "^5.6.2",
     "chrono-node": "^2.8.4",
     "cli-markdown": "^3.5.1",

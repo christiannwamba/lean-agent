@@ -1,8 +1,8 @@
 import { Command } from 'commander';
 import { cancel, intro, isCancel, outro, select, spinner, text } from '@clack/prompts';
-import type Anthropic from '@anthropic-ai/sdk';
 import chalk from 'chalk';
 import process from 'node:process';
+import type { ModelMessage } from 'ai';
 
 import { DEFAULT_REFERENCE_ISO, DEFAULT_TIMEZONE } from './dates.js';
 import {
@@ -97,7 +97,7 @@ async function runChat(options: ChatOptions): Promise<void> {
   intro('lean-agent');
   console.log(`Seeded demo with energy=${config.energyLabel}, tasks=${config.taskLabel}, hour=${config.currentHour}, tz=${config.timezone}`);
   console.log('Type `exit` or `quit` to end the session.');
-  let history: Anthropic.Beta.Messages.BetaMessageParam[] = [];
+  let history: ModelMessage[] = [];
   let sessionTokenTotal = 0;
 
   try {
@@ -163,7 +163,7 @@ async function runChat(options: ChatOptions): Promise<void> {
 
       stopLoading();
 
-      history = result.history as Anthropic.Beta.Messages.BetaMessageParam[];
+      history = result.history;
       sessionTokenTotal += result.usage.total.totalTokens;
 
       const rendered = renderAssistantOutput(result.assistantText);

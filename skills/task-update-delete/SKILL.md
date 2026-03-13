@@ -17,11 +17,12 @@ Use this skill when the user wants to modify, complete, remove, or cancel a task
 
 ## Workflow
 
-1. Resolve the task reference from the user's wording.
-2. If there is one confident match, continue.
-3. If there are multiple candidates, stop and ask which one.
-4. Call `update_task` or `delete_task`.
-5. Confirm the final result briefly.
+1. Call `search_tools` for the tools needed by `task-update-delete`.
+2. Resolve the task reference from the user's wording.
+3. If there is one confident match, continue.
+4. If there are multiple candidates, stop and ask which one.
+5. Call `update_task` or `delete_task`.
+6. Confirm the final result briefly.
 
 ## Update Guidance
 

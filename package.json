@@ -12,7 +12,8 @@
     "db:push": "drizzle-kit push --force",
     "db:studio": "drizzle-kit studio",
     "seed": "\"${BUN_BIN:-$HOME/.bun/bin/bun}\" src/db/seed.ts",
-    "parse-date": "\"${BUN_BIN:-$HOME/.bun/bin/bun}\" src/parse-date.ts"
+    "parse-date": "\"${BUN_BIN:-$HOME/.bun/bin/bun}\" src/parse-date.ts",
+    "tools": "\"${BUN_BIN:-$HOME/.bun/bin/bun}\" src/tools/cli.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",

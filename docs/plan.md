@@ -12,7 +12,7 @@
 | CLI output | `chalk` + `cli-markdown` | Colored log lines plus terminal-friendly Markdown rendering for assistant output. |
 | CLI commands | `commander` | Zero-dependency arg parser. Flags for `--energy`, `--tasks`, `--hour`, `--tz`, `--ref`, `--trace-agent`. |
 | Spinner | `@clack/prompts` spinner | Loading state while the assistant turn is in progress. |
-| Evals | `vitest-evals` | Vitest-native eval runner from Sentry. Custom Anthropic-based scorers so eval infra matches the runtime provider. |
+| Evals | `bun:test` | Bun's built-in test runner. Two-tier eval structure: deterministic tests (no API key) and live tests (real agent calls). Custom `judgeOutput` helper using Vercel AI SDK structured output for LLM-as-judge scoring. |
 | Validation | `zod` + `zod-to-json-schema` | Schema validation for tool inputs and type derivation. Zod 3 schemas are converted to JSON Schema before handing to the AI SDK. |
 
 ---
@@ -57,10 +57,12 @@ lean-agent/
 │   └── task-fetch/
 │       └── SKILL.md
 ├── evals/
-│   ├── vitest.evals.config.ts   # Eval-specific vitest config
-│   ├── skill-routing.eval.ts    # Deterministic routing tests
-│   ├── task-resolution.eval.ts  # Safe mutation / ambiguity tests
-│   └── output-quality.eval.ts   # LLM-as-judge quality tests
+│   ├── helpers.ts               # Shared eval infrastructure (seeding, tracing, judging)
+│   ├── skill-routing.eval.ts    # Deterministic + live routing tests
+│   ├── task-resolution.eval.ts  # Resolution rules + live mutation safety
+│   ├── usage-regression.eval.ts # Token cap assertions + tool narrowing + trace completeness
+│   ├── output-quality.eval.ts   # LLM-as-judge quality tests
+│   └── trajectory.eval.ts       # Multi-turn follow-ups + mid-trajectory course corrections
 ├── drizzle.config.ts
 ├── package.json
 └── tsconfig.json
@@ -491,117 +493,77 @@ Energy and task scenarios are independent — any combination works.
 
 ## Evals
 
-### Config
+All evals run via `bun:test`. Two tiers per file: **deterministic** tests (no API key, fast, unit-level) and **live** tests (require `ANTHROPIC_API_KEY`, call the real agent, inspect traces).
+
+Run all: `bun run evals`
+Run one: `bun test --timeout=120000 evals/skill-routing.eval.ts`
+
+### Shared infrastructure (`evals/helpers.ts`)
+
+| Helper | Purpose |
+|--------|---------|
+| `liveDescribe` / `liveTest` | Skip live tests when `ANTHROPIC_API_KEY` is absent. |
+| `makeChatConfig(overrides?)` | Default config: hour 11, `Europe/London`, fixed reference instant. |
+| `seedScenario(energy, tasks)` | Destructive seed before each live test. |
+| `runTracedConversation(inputs[], config)` | Runs multi-turn agent calls, collects traces and aggregated usage. |
+| `latestTraceForTurn(traces, turnIndex)` | Filters and sorts trace entries for a specific turn. |
+| `judgeOutput({ scenario, output, rubric })` | LLM-as-judge via `generateText` with `Output.object` structured output. Returns `{ score: 1-5, reasoning }`. |
+| `assertNoExplicitMaxTokenCaps(paths[])` | Asserts no `max_tokens` / `maxTokens` strings in source files. |
+
+### Eval 1: Skill routing (`skill-routing.eval.ts`)
+
+**Deterministic tier:** Tests `searchToolCatalog` directly — known skills return exact mapped tools before fuzzy fallback.
 
 ```typescript
-// vitest.evals.config.ts
-import { defineConfig } from 'vitest/config';
-
-export default defineConfig({
-  test: {
-    include: ['evals/**/*.eval.ts'],
-  },
+expect(searchToolCatalog({ skillName: 'task-fetch', query: 'show tasks' })).toEqual({
+  tools: ['get_task_list'],
 });
 ```
 
-Run with: `vitest --config vitest.evals.config.ts`
+**Live tier:** Runs the full agent for each input, inspects the first tool call in the trace to verify `load_skill` targets the correct skill.
 
-### Eval 1: Skill routing (deterministic)
+| Input | Expected skill |
+|-------|---------------|
+| `show me my tasks` | `task-fetch` |
+| `how's my energy right now?` | `energy-check` |
+| `what should I work on next?` | `task-prioritise` |
+| `mark the investor memo task as done` | `task-update-delete` |
 
-Tests whether Claude calls `load_skill` with the correct skill name for a given input.
+### Eval 2: Task resolution safety (`task-resolution.eval.ts`)
 
-```typescript
-describeEval('skill routing', {
-  data: async () => [
-    { input: 'add a task to write the report', expectedTools: [{ name: 'load_skill', arguments: { name: 'task-create' } }] },
-    { input: 'what should I work on next?', expectedTools: [{ name: 'load_skill', arguments: { name: 'task-prioritise' } }] },
-    { input: "how's my energy right now?", expectedTools: [{ name: 'load_skill', arguments: { name: 'energy-check' } }] },
-    { input: 'mark the report task as done', expectedTools: [{ name: 'load_skill', arguments: { name: 'task-update-delete' } }] },
-    { input: 'show me my tasks', expectedTools: [{ name: 'load_skill', arguments: { name: 'task-fetch' } }] },
-    // Ambiguous cases
-    { input: 'what now?', expectedTools: [{ name: 'load_skill', arguments: { name: 'task-prioritise' } }] },
-  ],
-  task: async (input) => {
-    return await getRoutedSkillName(input);
-  },
-  scorers: [ToolCallScorer({ requireAll: false, allowExtras: true })],
-  threshold: 0.8,
-});
-```
+**Deterministic tier:** Tests `resolveTask` directly — overlapping titles ("Write the report" + "Review the report") return `ambiguous` with 2 candidates.
 
-### Eval 2: Task resolution safety
+**Live tier:**
 
-Tests whether update/delete requests resolve the correct task and ask for clarification on ambiguous references.
+- Exact match mutates: "mark the investor memo task as done" → `resolve_task` + `update_task` called, task status changes to `done`.
+- Ambiguous match blocks: "mark the report task as done" (with two report tasks seeded) → `resolve_task` called, `update_task` not called, assistant asks "which one?".
+- Referential follow-up: "show me my tasks" then "complete the first one" → second turn calls `resolve_task` + `update_task` using context from the prior assistant message.
 
-```typescript
-describeEval('task resolution safety', {
-  data: async () => [
-    { input: 'mark the report task as done', expectedTools: [{ name: 'resolve_task' }, { name: 'update_task' }] },
-    { input: 'delete the planning task', expectedTools: [{ name: 'resolve_task' }, { name: 'delete_task' }] },
-    { input: 'mark the task as done', expectedTools: [{ name: 'resolve_task' }] }, // ambiguous, should not mutate
-  ],
-  task: async (input) => {
-    return await runMutationScenario(input);
-  },
-  scorers: [ToolCallScorer({ allowExtras: true })],
-  threshold: 0.8,
-});
-```
+### Eval 3: Usage regression (`usage-regression.eval.ts`)
 
-### Eval 3: Output quality (LLM-as-judge)
+**Deterministic tier:** Asserts no explicit `max_tokens` / `maxTokens` strings in `agent.ts` or any subagent file.
 
-Tests whether prioritisation output is energy-aware, deadline-sensitive, and actionable.
+**Live tier:**
 
-```typescript
-describeEval('prioritisation quality', {
-  data: async () => [
-    { input: { tasks: 'deadline_pressure', energy: 'poor_sleep', hour: 9 } },
-    { input: { tasks: 'overloaded_queue', energy: 'well_rested', hour: 10 } },
-    { input: { tasks: 'mismatched_priorities', energy: 'fragmented', hour: 14 } },
-    { input: { tasks: 'light_day', energy: 'evening_person', hour: 8 } },
-    { input: { tasks: 'recovery_day', energy: 'burnout', hour: 11 } },
-  ],
-  task: async (input) => {
-    return await runPrioritiseScenario(input);
-  },
-  scorers: [prioritisationJudge],
-  threshold: 0.6,
-});
-```
+- Token aggregation: `total.totalTokens == main.totalTokens + subagents.totalTokens`.
+- Tool narrowing: for `task-fetch`, executor steps only activate `['load_skill', 'search_tools', 'get_task_list']` — no extra tools.
+- Trace completeness: each step records non-empty `system`, `messages`, `activeTools`, and positive `usage.totalTokens`.
 
-The `prioritisationJudge` is a custom scorer that calls Claude as a grader:
+### Eval 4: Output quality (`output-quality.eval.ts`)
 
-```typescript
-async function prioritisationJudge({ input, output }) {
-  const response = await client.messages.create({
-    model: 'claude-sonnet-4-6',
-    max_tokens: 300,
-    system: `You are an eval grader. Score the following prioritisation output 1-5.
-Criteria:
-1. Did it identify correct upcoming energy windows?
-2. Did it assign tasks to appropriate windows based on effort?
-3. Did it flag deadline conflicts?
-4. Does it say WHEN to do things, not just WHAT?
-5. Would the recommendation differ for a different energy scenario?
-Return JSON: { "score": <1-5>, "reasoning": "<why>" }`,
-    messages: [{ role: 'user', content: `Scenario: ${JSON.stringify(input)}\n\nOutput:\n${output}` }],
-  });
+**Live tier only.** Uses `judgeOutput` to score agent output 1–5 against a rubric.
 
-  const text = response.content.find(b => b.type === 'text')?.text ?? '{}';
-  const { score, reasoning } = JSON.parse(text);
-  return { score: score / 5, metadata: { rawScore: score, reasoning } };
-}
-```
+| Scenario | Rubric | Min score |
+|----------|--------|-----------|
+| `poor_sleep` × `deadline_pressure`, hour 11 | Does the response account for low energy, deadline urgency, and recommend *when* to do work? | 3 |
+| `well_rested` × `deadline_pressure` | Does the response clearly list open tasks, group meaningfully, and surface deadline risk? | 4 |
 
-### Scenario matrix
+### Eval 5: Trajectory handling (`trajectory.eval.ts`)
 
-| Tasks | Energy | What it tests |
-|-------|--------|---------------|
-| `deadline_pressure` | `poor_sleep` | Ruthless triage under low energy |
-| `overloaded_queue` | `well_rested` | Filtering — defer what can't fit |
-| `mismatched_priorities` | `fragmented` | Deadline proximity over priority label |
-| `light_day` | `evening_person` | Don't recommend morning peak for a night owl |
-| `recovery_day` | `burnout` | Protect the user, don't just schedule them |
+**Live tier only.** Tests multi-turn coherence and mid-trajectory course correction.
+
+- **Sustained trajectory:** "show me my tasks" → "which one is due first?" → "mark that one done" — verifies the agent maintains context across 3 turns, resolves the referenced task, and mutates it.
+- **Course correction:** "show me my tasks" → "actually, how's my energy right now?" → "okay, mark the first one done" — verifies the agent loads `energy-check` in turn 2 (breaking the task flow), then returns to mutation in turn 3 without losing the original task list context.
 
 ---
 
@@ -631,14 +593,11 @@ Return JSON: { "score": <1-5>, "reasoning": "<why>" }`,
 
 ### Phase 4: Evals
 
-14. Skill routing eval — deterministic, all 5 skills + ambiguous cases.
-15. Task resolution safety eval — mutation only after successful resolution.
-16. Output quality eval — LLM-as-judge, all 5 scenario pairs.
-
-### Phase 5: Polish
-
-17. Error handling — API failures, malformed tool inputs, ambiguous task matches, empty scenarios.
-18. Demo walkthrough — verify all log lines appear, subagent logs visible, markdown renders cleanly.
+14. Skill routing eval — deterministic `searchToolCatalog` tests + live routing via traces.
+15. Task resolution safety eval — deterministic `resolveTask` tests + live mutation/ambiguity/follow-up tests.
+16. Usage regression eval — no explicit token caps in source, tool narrowing per step, trace completeness.
+17. Output quality eval — LLM-as-judge for prioritisation and task listing.
+18. Trajectory eval — multi-turn follow-ups and mid-trajectory course corrections.
 
 ---
 
@@ -799,11 +758,12 @@ Verification:
 
 ```bash
 bun run typecheck
-bun run vitest --config evals/vitest.evals.config.ts evals/skill-routing.eval.ts
-bun run vitest --config evals/vitest.evals.config.ts evals/task-resolution.eval.ts
-bun run vitest --config evals/vitest.evals.config.ts evals/usage-regression.eval.ts
-bun run vitest --config evals/vitest.evals.config.ts evals/output-quality.eval.ts
-bun run vitest --config evals/vitest.evals.config.ts
+bun test --timeout=120000 evals/skill-routing.eval.ts
+bun test --timeout=120000 evals/task-resolution.eval.ts
+bun test --timeout=120000 evals/usage-regression.eval.ts
+bun test --timeout=120000 evals/output-quality.eval.ts
+bun test --timeout=120000 evals/trajectory.eval.ts
+bun run evals
 ```
 
 Expected:
@@ -812,14 +772,7 @@ Expected:
 - token usage accounting is internally consistent
 - step traces expose enough information to explain high-cost turns
 - quality evals clear the chosen threshold on seeded scenarios
-
-### Bundle H: Error Handling + Polish
-
-Scope:
-
-13. Malformed tool input, API failure, empty-state handling, final demo walkthrough.
-
-Verification: trigger invalid inputs, confirm controlled failures, run full demo path end to end.
+- multi-turn trajectories maintain context and support course correction
 
 ## Commit Plan
 
@@ -832,4 +785,3 @@ Commit each bundle immediately after verification:
 - `bundle-e: add main agent and chat cli`
 - `bundle-f: add safe conversational mutation flow`
 - `bundle-g: add evals`
-- `bundle-h: add error handling and polish`

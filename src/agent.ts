@@ -2,7 +2,6 @@ import chalk from 'chalk';
 import { anthropic } from '@ai-sdk/anthropic';
 import {
   generateText,
-  jsonSchema,
   pruneMessages,
   stepCountIs,
   tool,
@@ -11,7 +10,6 @@ import {
   type ToolSet,
 } from 'ai';
 import { z } from 'zod';
-import { zodToJsonSchema } from 'zod-to-json-schema';
 
 import { DEFAULT_REFERENCE_ISO } from './dates.js';
 import { buildSkillSummary, discoverSkills, loadSkill } from './skills.js';
@@ -213,13 +211,6 @@ export type ChatTurnResult = {
   };
 };
 
-function zodJsonSchema(schema: z.ZodTypeAny) {
-  return zodToJsonSchema(schema, {
-    target: 'jsonSchema7',
-    $refStrategy: 'none',
-  }) as Record<string, unknown>;
-}
-
 function aiTool<Schema extends z.ZodTypeAny, Output>(options: {
   description: string;
   inputSchema: Schema;
@@ -228,8 +219,8 @@ function aiTool<Schema extends z.ZodTypeAny, Output>(options: {
   return tool<z.infer<Schema>, Output>(
     {
       description: options.description,
-      inputSchema: jsonSchema(zodJsonSchema(options.inputSchema)),
-      execute: async (input: unknown) => options.execute(options.inputSchema.parse(input)),
+      inputSchema: options.inputSchema,
+      execute: options.execute,
     } as never,
   );
 }
@@ -296,6 +287,10 @@ export function searchToolCatalog(input: z.infer<typeof searchToolsInputSchema>)
     };
   }
 
+  // This lexical fallback is intentionally simple and therefore not very reliable.
+  // It exists only as a basic escape hatch when a skill is unknown or unmapped.
+  // If we want broader, more robust tool discovery later, we should replace this
+  // with embeddings + vector search instead of making the token matching smarter.
   const queryTokens = normalizeQuery(input.query ?? '');
   const seen = new Set<FunctionalToolName>();
   const matches: Array<{
@@ -395,6 +390,15 @@ function selectStepState<TOOLS extends ToolSet>(steps: StepResult<TOOLS>[]) {
 }
 
 function pruneConsumedOrchestrationMessages(messages: ModelMessage[]): ModelMessage[] {
+  // Prune stale meta-tool call/result history while keeping the newest
+  // load_skill/search_tools exchange. With `before-last-message`, older
+  // orchestration for these tools falls away over time, but the latest
+  // skill/tool-selection state remains available for the next step.
+  // Example:
+  //   earlier messages -> load_skill(task-create), search_tools(create_task)
+  //   later message    -> load_skill(energy-check), search_tools(get_energy_context)
+  // After pruning, the older task-create meta-tool chatter is removed while
+  // the latest energy-check meta-tool chatter remains.
   return pruneMessages({
     messages,
     reasoning: 'none',

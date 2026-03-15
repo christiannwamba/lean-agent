@@ -1,6 +1,8 @@
 import { Command } from 'commander';
 import { cancel, intro, isCancel, outro, select, spinner, text } from '@clack/prompts';
 import chalk from 'chalk';
+import { appendFileSync, mkdirSync } from 'node:fs';
+import path from 'node:path';
 import process from 'node:process';
 import type { ModelMessage } from 'ai';
 
@@ -8,6 +10,7 @@ import { DEFAULT_REFERENCE_ISO, DEFAULT_TIMEZONE } from './dates.js';
 import {
   runChatTurn,
   createTerminalLogger,
+  type AgentStepTraceEntry,
   type ChatSessionConfig,
 } from './agent.js';
 import { getEnergyScenarioLabels, getTaskScenarioLabels, seedDatabase } from './db/seed.js';
@@ -19,6 +22,7 @@ type ChatOptions = {
   hour?: string;
   ref?: string;
   tz?: string;
+  traceAgent?: boolean;
 };
 
 type StartupConfig = ChatSessionConfig & {
@@ -93,12 +97,27 @@ async function runChat(options: ChatOptions): Promise<void> {
 
   const config = await resolveStartupConfig(options);
   await seedDatabase(config.energyLabel, config.taskLabel);
+  const traceFilePath = options.traceAgent
+    ? path.join(
+        process.cwd(),
+        'traces',
+        `agent-trace-${new Date().toISOString().replaceAll(':', '-').replaceAll('.', '-')}.jsonl`,
+      )
+    : undefined;
+
+  if (traceFilePath) {
+    mkdirSync(path.dirname(traceFilePath), { recursive: true });
+  }
 
   intro('lean-agent');
   console.log(`Seeded demo with energy=${config.energyLabel}, tasks=${config.taskLabel}, hour=${config.currentHour}, tz=${config.timezone}`);
+  if (traceFilePath) {
+    console.log(`Tracing agent steps to ${traceFilePath}`);
+  }
   console.log('Type `exit` or `quit` to end the session.');
   let history: ModelMessage[] = [];
   let sessionTokenTotal = 0;
+  let turnIndex = 0;
 
   try {
     while (true) {
@@ -159,12 +178,21 @@ async function runChat(options: ChatOptions): Promise<void> {
         history,
         userInput: input,
         logger,
+        turnIndex,
+        tracer: traceFilePath
+          ? {
+              traceStep(entry: AgentStepTraceEntry) {
+                appendFileSync(traceFilePath, `${JSON.stringify(entry)}\n`, 'utf8');
+              },
+            }
+          : undefined,
       });
 
       stopLoading();
 
       history = result.history;
       sessionTokenTotal += result.usage.total.totalTokens;
+      turnIndex += 1;
 
       const rendered = renderAssistantOutput(result.assistantText);
       if (rendered) {
@@ -192,6 +220,7 @@ program
   .option('--hour <0-23>', 'Current hour override')
   .option('--ref <iso>', 'Reference instant override', DEFAULT_REFERENCE_ISO)
   .option('--tz <timezone>', 'IANA timezone override', DEFAULT_TIMEZONE)
+  .option('--trace-agent', 'Write one JSONL trace line per model step')
   .action(runChat);
 
 if (import.meta.main) {

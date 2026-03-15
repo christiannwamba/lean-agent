@@ -5,16 +5,15 @@
 | Layer | Tool | Why |
 |-------|------|-----|
 | Runtime | `Bun` | Bun-first CLI runtime with native SQLite support and fast local execution. |
-| LLM | `@anthropic-ai/sdk` | Direct SDK. Use `anthropic.beta.messages.toolRunner({ stream: true })` for tool execution and `beta.messages.countTokens()` for real preflight budget tracking. |
+| LLM | `ai` + `@ai-sdk/anthropic` | Vercel AI SDK. `generateText` with `prepareStep` for step-level tool activation and system prompt injection. Better fit for the Next.js / Vercel-native audience. |
 | Database | `bun:sqlite` + `drizzle-orm/bun-sqlite` | Clean Bun-native SQLite path for a local demo. |
-| Date parsing | `chrono-node` | Parse natural-language deadlines into normalized timestamps for urgency bucketing and scheduling. |
-| Scenario picker | `@clack/prompts` | Minimal, modern terminal UI for polished scenario selection and startup choices. |
-| Chat input | Node `readline` | Simple prompt loop for ongoing message entry once chat starts. |
-| CLI output | `chalk` + `cli-markdown` | Colored log lines plus terminal-friendly rendering for assistant Markdown. |
-| CLI commands | `commander` | Zero-dependency arg parser. Subcommands for `chat`, `seed`. Flags for `--hour`, `--energy`. |
+| Date parsing | `chrono-node` | Parse natural-language deadlines into normalized timestamps. GB-biased (`en.GB`), `Europe/London` default. |
+| Scenario picker | `@clack/prompts` | Minimal, modern terminal UI for scenario selection and ongoing chat input. |
+| CLI output | `chalk` + `cli-markdown` | Colored log lines plus terminal-friendly Markdown rendering for assistant output. |
+| CLI commands | `commander` | Zero-dependency arg parser. Flags for `--energy`, `--tasks`, `--hour`, `--tz`, `--ref`, `--trace-agent`. |
 | Spinner | `@clack/prompts` spinner | Loading state while the assistant turn is in progress. |
-| Evals | `vitest-evals` | Vitest-native eval runner from Sentry. Use custom Anthropic-based scorers so eval infra matches the runtime provider. |
-| Validation | `zod` | Schema validation for tool inputs and type derivation; convert to JSON Schema before handing tools to the SDK in this Zod 3 stack. |
+| Evals | `vitest-evals` | Vitest-native eval runner from Sentry. Custom Anthropic-based scorers so eval infra matches the runtime provider. |
+| Validation | `zod` + `zod-to-json-schema` | Schema validation for tool inputs and type derivation. Zod 3 schemas are converted to JSON Schema before handing to the AI SDK. |
 
 ---
 
@@ -24,23 +23,24 @@
 lean-agent/
 ├── src/
 │   ├── index.ts                 # CLI entry point (commander)
-│   ├── chat.ts                  # Chat loop (readline + streaming)
-│   ├── agent.ts                 # Main agent (system prompt, tool definitions, message management)
-│   ├── context.ts               # Token tracking, compaction logic
+│   ├── chat.ts                  # Chat loop (clack prompts + markdown rendering)
+│   ├── agent.ts                 # Main agent (generateText + prepareStep, tool definitions, step orchestration)
+│   ├── usage.ts                 # Token usage tracking and aggregation
 │   ├── dates.ts                 # Deadline parsing + ISO normalization helpers
-│   ├── skills.ts                # Skill discovery + loadSkill tool
+│   ├── skills.ts                # Skill discovery + loadSkill
 │   ├── subagents/
-│   │   ├── anthropic.ts         # Shared Anthropic client + model defaults
-│   │   ├── energy-context.ts    # Energy subagent tool — compact curve summary
-│   │   ├── task-context.ts      # Task subagent tool — compact urgency/effort grouping
-│   │   └── task-list.ts         # Task-list subagent tool — concise user-facing list
+│   │   ├── energy-context.ts    # Energy subagent — compact curve summary
+│   │   ├── task-context.ts      # Task subagent — compact urgency/effort grouping
+│   │   └── task-list.ts         # Task-list subagent — concise user-facing list
 │   ├── tools/
 │   │   ├── task-create.ts       # Insert task row
 │   │   ├── task-resolve.ts      # Find a task by natural-language reference
 │   │   ├── task-update.ts       # Update task row
-│   │   ├── task-delete.ts       # Update task row
-│   │   ├── task-fetch.ts        # Internal task query helper
-│   │   └── energy-fetch.ts      # Internal energy query helper
+│   │   ├── task-delete.ts       # Delete task row
+│   │   ├── task-fetch.ts        # Internal task query helper (not exposed to agent)
+│   │   └── energy-fetch.ts      # Internal energy query helper (not exposed to agent)
+│   ├── ui/
+│   │   └── render.ts            # Markdown-to-terminal rendering
 │   └── db/
 │       ├── index.ts             # Database connection
 │       ├── schema.ts            # Drizzle table definitions
@@ -60,8 +60,7 @@ lean-agent/
 │   ├── vitest.evals.config.ts   # Eval-specific vitest config
 │   ├── skill-routing.eval.ts    # Deterministic routing tests
 │   ├── task-resolution.eval.ts  # Safe mutation / ambiguity tests
-│   ├── output-quality.eval.ts   # LLM-as-judge quality tests
-│   └── compaction.eval.ts       # Context preservation after compaction
+│   └── output-quality.eval.ts   # LLM-as-judge quality tests
 ├── drizzle.config.ts
 ├── package.json
 └── tsconfig.json
@@ -113,7 +112,121 @@ Schema sync: `drizzle-kit push`. No migrations.
 - All parsed task deadlines are stored as normalized ISO timestamps in `deadline_at`.
 - The original user phrase is preserved in `deadline_raw` for explainability.
 - Urgency bucketing (`within 8h`, `within 24h`, overdue, no deadline) always uses parsed `deadline_at`, never fuzzy string comparisons.
-- Seeded demo scenarios can still use deterministic fixed timestamps.
+- Deadline parsing uses `chrono-node` `en.GB` with `Europe/London` as the default timezone and a fixed reference instant (`2026-03-13T09:00:00.000Z`) for reproducible demos and evals.
+- Seeded demo scenarios use deterministic fixed timestamps anchored to the same reference instant.
+
+---
+
+## Orchestration Model
+
+The main agent uses Vercel AI SDK's `generateText` with `prepareStep` for step-level control. This replaces the earlier Anthropic SDK `toolRunner` approach.
+
+### Why `prepareStep`
+
+`prepareStep` fires before each model step, receiving the full step history. It returns overrides for `activeTools`, `system`, and `messages`. This gives us:
+
+- **Step-scoped tool activation** without code-based intent classification — the model loads a skill, then searches for tools, and `prepareStep` reads the latest tool results to decide what's available next.
+- **System prompt injection** per step — skill instructions are layered onto the base prompt only when active, without polluting the message transcript.
+- **Message pruning** between steps — consumed orchestration messages (`load_skill`, `search_tools` calls from before the latest message) are pruned to save tokens.
+
+### Two-tier tool architecture
+
+Tools are split into **meta tools** and **functional tools**.
+
+**Meta tools** are always available:
+
+| Tool | Purpose |
+|------|---------|
+| `load_skill` | Returns `{ name }`. Full skill instructions are loaded locally and injected into the next step's system prompt. |
+| `search_tools` | Returns `{ tools: FunctionalToolName[] }`. Activates functional tools for the next step. |
+
+**Functional tools** are step-scoped — only available after `search_tools` activates them:
+
+| Tool | Purpose |
+|------|---------|
+| `create_task` | Insert task row with normalized deadline fields. |
+| `resolve_task` | Match natural-language task reference to exact or candidate list. |
+| `update_task` | Update task row (blocked unless `resolve_task` succeeded this turn). |
+| `delete_task` | Delete task row (blocked unless `resolve_task` succeeded this turn). |
+| `get_energy_context` | Subagent — compact energy curve summary. |
+| `get_task_context` | Subagent — compact task urgency/effort grouping. |
+| `get_task_list` | Subagent — concise markdown task list for display. |
+
+This separation means the model's first step always sees only 2 tools (load_skill, search_tools). Functional tools appear only after the model has chosen a direction. This saves tokens on tool definitions in early steps.
+
+### Skill → tool activation flow
+
+1. Model calls `load_skill({ name: "task-create" })` → returns `{ name: "task-create" }`.
+2. Model calls `search_tools({ skillName: "task-create" })` → returns `{ tools: ["create_task", "get_task_context", "get_energy_context"] }`.
+3. `prepareStep` reads the latest `load_skill` and `search_tools` results from step history.
+4. Next step gets: active skill instructions in the system prompt, activated functional tools, pruned orchestration messages.
+
+### `search_tools` routing
+
+Exact-first, fuzzy fallback:
+
+- If `skillName` maps to a known key in `SKILL_TOOL_MAP`, return exactly those tools. No fuzzy expansion.
+- Otherwise, tokenize the `query` and score each functional tool's metadata (description, skills, keywords) by token overlap. Return top matches.
+
+The exact map:
+
+```typescript
+const SKILL_TOOL_MAP: Record<string, FunctionalToolName[]> = {
+  'energy-check': ['get_energy_context'],
+  'task-create': ['create_task', 'get_task_context', 'get_energy_context'],
+  'task-fetch': ['get_task_list'],
+  'task-prioritise': ['get_task_context', 'get_energy_context'],
+  'task-update-delete': ['resolve_task', 'update_task', 'delete_task', 'get_task_context', 'get_energy_context'],
+};
+```
+
+**Why `task-create` includes both context tools:** Task creation should be schedule-aware. The agent calls `get_energy_context` and `get_task_context` to understand where a new task fits in the day, and can suggest optimal timing or auto-schedule when the user doesn't provide a time.
+
+**Why `task-update-delete` includes both context tools:** After a mutation, the agent may reason about reshuffling remaining tasks into freed or shifted windows. Context tools give it the landscape to make those recommendations.
+
+### Step state selection
+
+`selectStepState` inspects all completed steps to find:
+- The latest `load_skill` result → determines `activeSkillName`
+- The latest `search_tools` result → determines `functionalTools`
+- If `search_tools` is more recent than `load_skill`, use its tool list. Otherwise, only meta tools are active.
+
+Meta tools are always appended, so the model can re-anchor by loading a different skill at any point.
+
+### Message pruning
+
+`pruneConsumedOrchestrationMessages` uses AI SDK's `pruneMessages` to strip `load_skill` and `search_tools` tool call/result pairs from before the latest message. This is a step-level token control mechanism, separate from tool activation. It prevents orchestration chatter from accumulating across steps within a turn.
+
+---
+
+## System Prompt Design
+
+### Base prompt (every step)
+
+The base system prompt is preserved across all steps. It contains:
+
+- Core assistant behavior (concise, practical, tool-dependent, never invent data)
+- Mutation safety rules ("before `update_task` or `delete_task`, call `resolve_task`")
+- Session context (current hour, timezone, reference instant)
+- Full skill summary (name + description for all discovered skills)
+
+**Conscious tradeoff:** Including the skill summary in every step costs tokens but ensures the model can always discover and re-anchor to any skill. Without it, the model loses the ability to change direction after an initial skill load. This is load-bearing for trajectory correction.
+
+### Active skill layer (step-scoped)
+
+When `load_skill` has been called, the next step's system prompt appends:
+
+```
+## Active Skill
+Current skill: task-prioritise
+[full SKILL.md body]
+```
+
+This replaces the old skill on each step — not by deleting a message from the transcript, but by rebuilding the system prompt. The previous skill's instructions simply disappear from the next step's context.
+
+### What is NOT in the prompt
+
+Seed scenario labels are intentionally not injected. The agent should reason from time, tools, and returned data — not cheat from metadata about which scenario was selected.
 
 ---
 
@@ -123,7 +236,7 @@ Skills follow a three-phase lifecycle: discover, activate, execute.
 
 ### Phase 1: Discovery (startup)
 
-Scan `skills/` directory. Parse frontmatter (`name`, `description`) from each `SKILL.md`. Inject a summary into the system prompt:
+Scan `skills/` directory. Parse frontmatter (`name`, `description`) from each `SKILL.md`. Build a summary for the base system prompt:
 
 ```
 ## Skills
@@ -140,29 +253,13 @@ Available skills:
 
 ### Phase 2: Activation (on demand)
 
-A `load_skill` tool reads the full `SKILL.md` body and returns it as a `tool_result`. Claude calls this when it decides it needs a skill's reasoning instructions.
+`load_skill` returns only `{ name }` to the model. The full `SKILL.md` body is loaded locally by `loadSkill(name)` and injected into the next step's system prompt by `buildStepSystemPrompt`. The instructions never enter the message transcript as a `tool_result`.
 
-```typescript
-const loadSkillTool = betaZodTool({
-  name: 'load_skill',
-  description: 'Load specialized instructions for a skill before performing the task.',
-  inputSchema: z.object({
-    name: z.string().describe('Skill name to load'),
-  }),
-  run: async ({ name }) => {
-    const skill = discoveredSkills.find(s => s.name === name);
-    if (!skill) return `Skill '${name}' not found`;
-    const content = readFileSync(skill.path, 'utf-8');
-    return stripFrontmatter(content);
-  },
-});
-```
-
-This is turn-scoped by nature — the instructions live in a `tool_result`, not in the system prompt. They do not persist to subsequent turns.
+This is a key token-saving decision. The skill instructions appear in the system prompt for the steps that need them, then vanish when the system prompt is rebuilt without them.
 
 ### Phase 3: Execution
 
-After loading instructions, Claude calls the relevant operation tools (`create_task`, `update_task`, etc.) to act on the database.
+After loading instructions, the model calls `search_tools` to activate functional tools, then uses those tools to act on the database.
 
 ### SKILL.md format
 
@@ -192,145 +289,133 @@ Each `SKILL.md` contains the full reasoning chain, rules, and output format from
 
 ---
 
-## Tools
-
-Seven tools total: one meta-tool (`load_skill`), four mutation tools, three subagent read tools.
-
-### Operation tools (always available)
-
-| Tool | Input | Effect |
-|------|-------|--------|
-| `create_task` | `{ title, effort, priority, deadline_raw?, duration_minutes, category? }` | Parse deadline if present, insert row into `tasks`, return the created task with normalized deadline fields. |
-| `resolve_task` | `{ query, include_done? }` | Match a natural-language task reference to candidate rows. Returns exact match or a short candidate list for confirmation. |
-| `update_task` | `{ id, fields: Partial<Task> }` | Update row. Returns updated task. |
-| `delete_task` | `{ id }` | Delete row. Returns confirmation. |
-
-### Context tools (subagents)
-
-| Tool | Input | Effect |
-|------|-------|--------|
-| `get_energy_context` | `{ current_hour: number }` | Runs the energy subagent. Returns a compact summary (~60 tokens) of current level, next peak, next dip, next rebound. |
-| `get_task_context` | `{}` | Runs the task subagent. Returns a compact summary (~80 tokens) grouping open tasks by deadline urgency and effort. |
-| `get_task_list` | `{ status?: string }` | Runs the task-list subagent. Returns a concise user-facing Markdown list grouped for display. |
-
-These are general-purpose read tools, not tied to any single skill. Claude uses them for all read access. Raw database fetch helpers stay internal to the app and are never exposed to the main agent.
-
-Each tool wraps a standalone `client.messages.create()` call internally. The main agent never sees the subagent's full context — only the compact summary returned as a `tool_result`.
-
-### Task mutation workflow
-
-- Natural-language updates and deletes do not go straight to `update_task` or `delete_task`.
-- The agent first calls `resolve_task`.
-- If there is one confident match, proceed with the mutation.
-- If there are multiple plausible matches, the assistant asks a short clarification question before mutating anything.
-- This keeps mutation tools simple while still supporting natural user phrasing like "mark the report task as done".
-
----
-
 ## Subagents
 
-Three subagents exposed as tools. Each is a standalone `client.messages.create()` call with its own system prompt and constrained output. The main agent calls them whenever it needs situational awareness or display-ready read access.
+Three subagents exposed as functional tools. Each calls `generateText` with `anthropic(...)` internally — using the same AI SDK as the main agent for consistent usage accounting. The main agent never sees the subagent's full context; only the compact summary string enters the main agent's context as a tool result.
 
-The point of these subagents is deliberate context compression. As task volume grows, passing the raw task table or verbose energy reasoning into the main agent becomes noisy. Each subagent fetches narrow structured data, cleans it up, summarizes only decision-relevant points, and returns a bounded result to the main agent.
+The point of subagents is deliberate context compression. As task volume grows, passing the raw task table or verbose energy reasoning into the main agent becomes noisy. Each subagent fetches narrow structured data, summarizes only decision-relevant points, and returns a bounded result.
 
 ### Energy subagent (`get_energy_context`)
 
 - **Input:** 24-value energy array + current hour
-- **System prompt:** "You are an energy curve analyst. Return a compact summary: current level, next peak (time range), next dip (time range), next rebound (time range). Max 60 tokens."
-- **Output:** ~60 token structured summary
-- **Context isolation:** Separate API call. Only the summary string enters the main agent's context.
-- **Pre-trim step:** The wrapper sends only the 24-value curve, date, timezone, and current hour. No scenario labels or chat history are forwarded.
+- **System prompt:** Compact energy curve analyst. Returns current level, next peak, next dip, next rebound.
+- **Pre-trim:** Only the 24-value curve, date, timezone, and current hour are forwarded. No scenario labels or chat history.
+- **Returns:** Summary text + usage stats.
 
 ### Task subagent (`get_task_context`)
 
-- **Input:** Open task list only, trimmed to `id`, `title`, `effort`, `priority`, `duration_minutes`, `deadline_at`, `status`
-- **System prompt:** "You are a task analyst. Group tasks by deadline urgency (overdue, within 8h, within 24h, later, no deadline) and effort level. Return a compact summary. Max 80 tokens."
-- **Output:** ~80 token structured summary
-- **Context isolation:** Same as above.
-- **Pre-trim step:** The wrapper strips unused columns and excludes done tasks before the subagent call.
+- **Input:** Open task list only, trimmed to `id`, `title`, `effort`, `priority`, `durationMinutes`, `deadlineAt`, `status`
+- **System prompt:** Groups tasks by deadline urgency (overdue, within 8h, 24h, later, no deadline) and effort level.
+- **Pre-trim:** Strips unused columns and excludes done tasks before the subagent call.
+- **Returns:** Summary text + usage stats.
 
 ### Task-list subagent (`get_task_list`)
 
-- **Input:** Open task list only, trimmed to `id`, `title`, `effort`, `priority`, `duration_minutes`, `deadline_at`, `status`
-- **System prompt:** "You are a task list formatter. Return a concise, user-facing markdown list of tasks grouped by priority. Include id, title, effort, duration, and deadline when present. Exclude any analysis beyond a one-line count summary."
-- **Output:** concise Markdown list suitable for terminal rendering
-- **Context isolation:** Same as above.
-- **Pre-trim step:** The wrapper strips unused columns and excludes done tasks by default before the subagent call.
+- **Input:** Open task list, same trimmed columns as task context.
+- **System prompt:** Formats tasks as compact markdown grouped by priority. One bullet per task with id, title, effort, duration, deadline.
+- **Returns:** Markdown text + usage stats.
 
-### When Claude calls them
+### Read boundary rule
 
-- **Prioritising:** Calls both in sequence, reasons across the two summaries.
-- **Task listing:** Calls `get_task_list` so the main agent never sees raw task rows.
-- **Creating a task:** Calls both to understand where the new task fits in the day's schedule and energy curve. Can suggest optimal timing.
-- **Updating a task:** Calls `get_task_context` to see the current landscape, may call `get_energy_context` if the change affects scheduling (e.g., bumping effort from low to high).
-- **Deleting a task:** Calls `get_task_context` to see what opens up. May recommend reshuffling remaining tasks into freed windows.
-- **Energy check:** Calls `get_energy_context` directly — this is the subagent's exact purpose.
-
-Claude decides when to call these based on the situation. The skill instructions in each `SKILL.md` can hint at when context is useful, but the agent is not forced to call them for every operation.
+Raw database fetch helpers (`fetchTasks`, `fetchEnergy`) are internal to the app. The main agent reads exclusively through subagents. This is the "context compression first" architecture — the agent never sees raw rows.
 
 ### Scaling rule
 
-- For small seeded scenarios, subagents are still used so the architecture matches the intended scaling pattern.
-- If task volume grows, only the subagent payload grows; the main agent still receives the same bounded summaries.
-- Keep subagent outputs short and structured so they remain composable.
+For small seeded scenarios, subagents are still used so the architecture matches the intended scaling pattern. If task volume grows, only the subagent payload grows; the main agent still receives the same bounded summaries.
 
 ---
 
-## Context Management
+## Mutation Safety
 
-### Token budget
+Mutation safety is enforced in code, not just prompted.
 
-- **Max context:** 10,000 tokens (intentionally low to force compaction during demos)
-- **Compaction trigger:** 8,000 tokens
-- **Tracking:** Before each main-agent turn, call `client.beta.messages.countTokens()` with the exact payload shape that will be sent next: system prompt, retained messages, and all currently registered tools.
-- **Display value:** Show the preflight token count as the running context size after each turn.
+### Turn-local resolution guard
 
-### Compaction
+A `resolvedTaskIds` Set is created fresh for each turn inside `buildTools`. When `resolve_task` returns an exact match, the task's `id` is added to the set. `update_task` and `delete_task` check this set before executing — if the id hasn't been resolved in the current turn, the tool throws.
 
-When the preflight count crosses 8,000 tokens, a dedicated compaction call fires before the next user turn.
+This is an invariant: no mutation without prior exact resolution in the same turn.
+
+### Task resolution algorithm
+
+`resolve_task` uses lexical matching with specific thresholds:
+
+- Stop-word filtering (`task`, `todo`, `item`, `the`, `a`, `an`)
+- Exact title match → score 100
+- Substring match → score 90
+- Reverse substring → score 80
+- Token overlap → 12 points per full match, 6 per partial
+- Single result with score ≥ 90 → `exact` match, proceed with mutation
+- Multiple candidates → `ambiguous`, assistant asks for clarification
+- No matches → `none`
+
+### Mutation workflow
+
+1. User says "mark the report task as done"
+2. Agent calls `resolve_task({ query: "report" })`
+3. If exact → `resolvedTaskIds.add(id)`, then `update_task({ id, fields: { status: "done" } })`
+4. If ambiguous → agent asks "Did you mean X or Y?" — no mutation
+5. If none → agent reports no match found
+
+---
+
+## Conversation History
+
+History keeps only user and assistant text messages. All tool call/result pairs, orchestration messages, and subagent exchanges are excluded from the persisted history between turns.
 
 ```typescript
-async function compact(messages: MessageParam[]): Promise<MessageParam[]> {
-  const summary = await client.messages.create({
-    model: 'claude-sonnet-4-6',
-    max_tokens: 500,
-    system: `Compress this conversation history into a structured summary.
-Preserve verbatim:
-- Today's active energy scenario label
-- Any tasks created, updated, or completed this session
-- Any explicit user preferences stated this session
-- Any unresolved task references awaiting confirmation
-Summarise everything else into:
-- current objective
-- resolved decisions
-- open questions
-- relevant constraints`,
-    messages: [{ role: 'user', content: JSON.stringify(messages) }],
-  });
-
-  const summaryText = summary.content.find(b => b.type === 'text')?.text ?? '';
-  const recentTurns = messages.slice(-4); // last 2 exchanges
-
-  return [
-    { role: 'assistant', content: `[Session summary]\n${summaryText}` },
-    ...recentTurns,
-  ];
-}
+return {
+  history: [...params.history, userMessage, assistantMessage],
+  assistantText,
+  usage: { main, subagents, total },
+};
 ```
 
-### Token display
+Where `userMessage` and `assistantMessage` contain only `[{ type: 'text', text: '...' }]` content blocks.
 
-After each turn, log the count:
+**Why:** Context growth is linear and incremental — each turn adds one user message and one assistant response. Tool history from the previous turn is consumed and discarded. This keeps the message array lean without needing summarization or compaction.
+
+---
+
+## Token Usage Accounting
+
+Token accounting is a first-class product behavior, not a background budget.
+
+### Per-turn display
+
+After each turn, the CLI displays:
 
 ```
-[context: 3,241 / 10,000 tokens]
+[tokens: turn 4,231 | session 12,847 | main 3,102 | subagents 1,129]
 ```
 
-When compaction fires:
+- **turn** — total tokens for this user turn (main + subagents)
+- **session** — cumulative sum across all turns in this chat session
+- **main** — main agent steps only (from `result.totalUsage`)
+- **subagents** — separate subagent calls only (tracked via `trackSubagentUsage` callback)
 
-```
-[compaction fired at 8,012 tokens → compressed to 1,847]
-```
+### Why this matters
+
+Most token cost comes from repeated input (system prompt + message history sent on every step), not output. The main/subagent split makes this visible. The session total tracks cumulative cost across the demo.
+
+### No compaction
+
+The earlier plan specified a 10,000-token budget with compaction at 8,000. This is no longer implemented. History growth is linear (text-only, no tool history), so compaction is not needed for the demo scope. If session length grows to require it, it can be added later without architectural changes.
+
+---
+
+## Step Tracing
+
+`--trace-agent` writes one JSONL record per model step to `traces/agent-trace-<timestamp>.jsonl`. Each record includes:
+
+- `turnIndex`, `userInput`, `stepNumber`
+- `activeSkillName`, `activeTools`
+- `system` (full system prompt for this step)
+- `messages` (message array as sent to the model)
+- `toolCalls`, `toolResults`
+- `usage` (tokens for this step)
+- `text`, `finishReason`
+
+This is the primary debugging tool for token optimization decisions. It shows exactly what the model saw at each step — which tools were active, what the system prompt contained, how messages were pruned.
 
 ---
 
@@ -339,50 +424,43 @@ When compaction fires:
 ### Entry point
 
 ```
-lean-agent chat [--energy <scenario>] [--hour <0-23>] [--tasks <scenario>]
-lean-agent seed --energy <scenario> --tasks <scenario>
+lean-agent chat [--energy <label>] [--tasks <label>] [--hour <0-23>] [--tz <timezone>] [--ref <iso>] [--trace-agent]
+lean-agent seed --energy <label> --tasks <label>
 ```
 
 ### Startup flow
 
 1. Parse flags via `commander`.
-2. If `--energy` or `--tasks` not provided, prompt interactively using `readline` (list scenarios, let user pick).
-3. Run seed for selected scenarios (clear + insert).
-   This is intentionally destructive in `chat` mode because this is a throwaway demo / proof of concept, not a persistent personal task manager.
-4. Enter chat loop.
+2. If `--energy` or `--tasks` not provided, prompt interactively using `@clack/prompts` `select()`.
+3. Default to the current local hour in the configured timezone unless `--hour` is explicitly provided.
+4. Run seed for selected scenarios (destructive: clear + insert). Intentionally destructive because this is a throwaway demo, not a persistent task manager.
+5. Enter chat loop.
 
 ### Chat loop
 
-1. `readline` prompts for input.
+1. `@clack/prompts` `text()` prompts for input.
 2. On input:
-   - Build messages array (system prompt + conversation history).
-   - Preflight with `client.beta.messages.countTokens()`. If >= 8,000, run compaction first, then re-count.
-   - Call `client.beta.messages.toolRunner({ stream: true })` with all Zod tools.
-3. Stream response:
-   - On tool events → log `[skill: task-prioritise]`, `[tool: create_task]`, `[tool: resolve_task]` in chalk dim.
-   - On context-tool execution → log `[subagent: energy]` or `[subagent: tasks]`.
-   - On `text` deltas → `process.stdout.write(delta)` directly.
-   - These interleave naturally because Claude can stream text, call a tool, then continue streaming.
-4. After stream completes:
-   - Append assistant message to history.
-   - Run a new preflight count for the next turn and display `[context: X / 10,000 tokens]`.
+   - Start spinner (`Thinking...`).
+   - Call `runChatTurn` with config, history, input, and a terminal logger.
+3. During the turn:
+   - On tool events → clear spinner, log `[skill: ...]` / `[tool: ...]` / `[subagent: ...]` in chalk dim, resume spinner (`Waiting...`).
+   - Log lines appear immediately as tools fire.
+4. After turn completes:
+   - Stop spinner.
+   - Render assistant output as terminal-friendly Markdown via `cli-markdown`.
+   - Display token usage line.
    - Return to step 1.
 
-### Streaming + log interleaving
+### Output rendering
 
-The runner stream produces text and tool events in order. A single response can contain:
+Assistant output is rendered after the turn completes, not streamed token-by-token. This is a deliberate UX tradeoff: clean terminal Markdown over raw streaming. Tool/subagent log lines still appear in real time during the turn, so the user sees activity before the final rendered response.
 
-```
-[text delta] [text delta] ... [tool_use] [tool_result] [text delta] [text delta] ...
-```
+### Spinner policy
 
-Handle each event type as it arrives:
-
-- `content_block_start` with `type: 'tool_use'` → log the tool name
-- `content_block_delta` with `type: 'text_delta'` → write to stdout
-- Between tool calls, the agent may emit text explaining what it's doing — this streams naturally
-
-The log lines (`[skill: ...]`, `[subagent: ...]`, `[context: ...]`) are our additions, printed by the CLI handler, not by Claude.
+- Spinner starts on user input (`Thinking...`).
+- Clears (not stops) before each log line so the line appears cleanly.
+- Resumes after each log line (`Waiting...`).
+- Stops when the turn completes, before rendering output.
 
 ---
 
@@ -390,11 +468,11 @@ The log lines (`[skill: ...]`, `[subagent: ...]`, `[context: ...]`) are our addi
 
 ### Energy scenarios (5 rows)
 
-Stored in the seed script as literal arrays. Labels: `well_rested`, `poor_sleep`, `evening_person`, `fragmented`, `burnout`. Values per the brief.
+Stored in the seed script as literal arrays. Labels: `well_rested`, `poor_sleep`, `evening_person`, `fragmented`, `burnout`. Values per the brief. All anchored to a fixed reference date and timezone for reproducibility.
 
 ### Task scenarios (5 sets)
 
-Each scenario is a named set of task rows. Labels: `deadline_pressure`, `overloaded_queue`, `light_day`, `mismatched_priorities`, `recovery_day`.
+Each scenario is a named set of task rows. Labels: `deadline_pressure`, `overloaded_queue`, `light_day`, `mismatched_priorities`, `recovery_day`. Deadline parsing uses the fixed reference instant so seeded deadlines are deterministic.
 
 ### Seed script
 
@@ -442,10 +520,8 @@ describeEval('skill routing', {
     { input: 'show me my tasks', expectedTools: [{ name: 'load_skill', arguments: { name: 'task-fetch' } }] },
     // Ambiguous cases
     { input: 'what now?', expectedTools: [{ name: 'load_skill', arguments: { name: 'task-prioritise' } }] },
-    // Edge cases: all tasks done, no deadlines, empty list
   ],
   task: async (input) => {
-    // Call agent with input, intercept the tool call trace, return { result, toolCalls }
     return await getRoutedSkillName(input);
   },
   scorers: [ToolCallScorer({ requireAll: false, allowExtras: true })],
@@ -462,7 +538,7 @@ describeEval('task resolution safety', {
   data: async () => [
     { input: 'mark the report task as done', expectedTools: [{ name: 'resolve_task' }, { name: 'update_task' }] },
     { input: 'delete the planning task', expectedTools: [{ name: 'resolve_task' }, { name: 'delete_task' }] },
-    { input: 'mark the task as done', expectedTools: [{ name: 'resolve_task' }] }, // ambiguous, should not mutate yet
+    { input: 'mark the task as done', expectedTools: [{ name: 'resolve_task' }] }, // ambiguous, should not mutate
   ],
   task: async (input) => {
     return await runMutationScenario(input);
@@ -486,7 +562,6 @@ describeEval('prioritisation quality', {
     { input: { tasks: 'recovery_day', energy: 'burnout', hour: 11 } },
   ],
   task: async (input) => {
-    // Seed scenario, run full agent with "what should I work on?", return output
     return await runPrioritiseScenario(input);
   },
   scorers: [prioritisationJudge],
@@ -499,7 +574,7 @@ The `prioritisationJudge` is a custom scorer that calls Claude as a grader:
 ```typescript
 async function prioritisationJudge({ input, output }) {
   const response = await client.messages.create({
-      model: 'claude-sonnet-4-6',
+    model: 'claude-sonnet-4-6',
     max_tokens: 300,
     system: `You are an eval grader. Score the following prioritisation output 1-5.
 Criteria:
@@ -517,10 +592,6 @@ Return JSON: { "score": <1-5>, "reasoning": "<why>" }`,
   return { score: score / 5, metadata: { rawScore: score, reasoning } };
 }
 ```
-
-### Eval 4: Context compaction
-
-Tests that long chat sessions preserve current scenario, task mutations, user preferences, and unresolved references after compaction.
 
 ### Scenario matrix
 
@@ -541,53 +612,46 @@ Tests that long chat sessions preserve current scenario, task mutations, user pr
 1. Project init — `package.json`, `tsconfig.json`, dependencies.
 2. Database — schema, connection, `drizzle-kit push`.
 3. Seed script — all 5 energy scenarios, all 5 task scenarios, interactive selection.
+4. Date parsing helpers — `chrono-node` with GB bias, fixed reference instant.
 
 ### Phase 2: Agent core
 
-4. Skill files — write all 5 `SKILL.md` files with frontmatter, reasoning chains, output formats.
-5. Skill discovery — scan, parse frontmatter, build summary prompt.
-6. Tool definitions — `load_skill` + 6 operation tools.
-7. Subagents — energy and task subagent functions.
-8. Agent loop — system prompt assembly, `toolRunner({ stream: true })`, tool call handling.
+5. Skill files — write all 5 `SKILL.md` files with frontmatter, reasoning chains, output formats.
+6. Skill discovery — scan, parse frontmatter, build summary prompt, `loadSkill`.
+7. Tool definitions — meta tools (`load_skill`, `search_tools`) + functional tools + subagent wrappers.
+8. Subagents — energy context, task context, task list with pre-trimmed payloads.
+9. Agent loop — `generateText` + `prepareStep`, step state selection, message pruning, system prompt assembly.
 
 ### Phase 3: CLI
 
-9. Chat loop — `readline` input, streaming output, interleaved log lines.
-10. Context management — token counting after each turn, compaction when threshold hit.
-11. CLI entry point — `commander` with `chat` and `seed` subcommands, flags, interactive fallback.
+10. Chat loop — Clack prompts, spinner, immediate log lines, markdown rendering.
+11. Token usage display — per-turn and per-session accounting.
+12. CLI entry point — `commander` with flags, interactive fallback.
+13. Step tracing — `--trace-agent` JSONL output.
 
 ### Phase 4: Evals
 
-12. Skill routing eval — deterministic, all 5 skills + ambiguous cases.
-13. Task resolution safety eval — mutation only after successful resolution.
-14. Output quality eval — LLM-as-judge, all 5 scenario pairs.
-15. Context compaction eval — preserve scenario state and mutation history.
+14. Skill routing eval — deterministic, all 5 skills + ambiguous cases.
+15. Task resolution safety eval — mutation only after successful resolution.
+16. Output quality eval — LLM-as-judge, all 5 scenario pairs.
 
 ### Phase 5: Polish
 
-16. Error handling — API failures, malformed tool inputs, ambiguous task matches, empty scenarios.
-17. Demo walkthrough — verify all log lines appear, compaction triggers, subagent logs visible.
+17. Error handling — API failures, malformed tool inputs, ambiguous task matches, empty scenarios.
+18. Demo walkthrough — verify all log lines appear, subagent logs visible, markdown renders cleanly.
 
 ---
 
 ## Implementation Checkpoints
 
-This section is the execution source of truth for incremental implementation. Work proceeds bundle by bundle. Stop after each bundle, run the listed verification steps in sequence, and only continue after confirming the results.
+Work proceeds bundle by bundle. Stop after each bundle, run the listed verification steps, and only continue after confirming the results.
 
 ### Bundle A: Runtime + Database Foundation
 
 Scope:
 
-1. Project bootstrap
-   - `package.json`
-   - `tsconfig.json`
-   - Bun runtime metadata
-   - base scripts
-2. Database foundation
-   - Drizzle config
-   - SQLite connection
-   - schema for `tasks` and `energy_days`
-   - `data/` directory bootstrap
+1. Project bootstrap — `package.json`, `tsconfig.json`, Bun runtime, base scripts.
+2. Database foundation — Drizzle config, SQLite connection, schema for `tasks` and `energy_days`, `data/` directory.
 
 Verification:
 
@@ -600,26 +664,14 @@ sqlite3 data/lean-agent.db "pragma table_info(tasks);"
 sqlite3 data/lean-agent.db "pragma table_info(energy_days);"
 ```
 
-Expected checks:
-
-- install succeeds
-- typecheck passes
-- schema push succeeds
-- `tasks` contains `deadline_at`, `deadline_timezone`, `deadline_raw`
-- `energy_days` contains `timezone`
+Expected: install succeeds, typecheck passes, `tasks` contains `deadline_at`/`deadline_timezone`/`deadline_raw`, `energy_days` contains `timezone`.
 
 ### Bundle B: Seed Data + Deadline Parsing
 
 Scope:
 
-3. Seed system
-   - 5 energy scenarios
-   - 5 task scenarios
-   - destructive reset + insert flow
-4. Date parsing helpers
-   - natural-language deadline parsing
-   - normalization to ISO UTC
-   - preserve raw user text and timezone
+3. Seed system — 5 energy scenarios, 5 task scenarios, destructive reset + insert.
+4. Date parsing — natural-language deadline parsing, ISO normalization, fixed reference instant.
 
 Verification:
 
@@ -627,209 +679,157 @@ Verification:
 bun run typecheck
 bun run seed -- --list
 bun run parse-date -- "tomorrow at 4pm" --ref 2026-03-13T09:00:00.000Z --tz Europe/London
-
 bun run seed -- --energy well_rested --tasks deadline_pressure
-sqlite3 data/lean-agent.db "select label || '|' || date || '|' || timezone from energy_days;"
-sqlite3 data/lean-agent.db "select id || '|' || title || '|' || effort || '|' || priority || '|' || ifnull(deadline_at,'') || '|' || ifnull(deadline_raw,'') || '|' || duration_minutes from tasks order by id;"
-
 bun run seed -- --energy poor_sleep --tasks overloaded_queue
-sqlite3 data/lean-agent.db "select label from energy_days;"
-sqlite3 data/lean-agent.db "select count(*) from tasks;"
-sqlite3 data/lean-agent.db "select title from tasks order by id limit 5;"
 ```
 
-Expected checks:
-
-- seed command lists all 5 energy and 5 task scenarios
-- parser returns normalized deadline fields
-- seeding `deadline_pressure` produces 6 tasks
-- reseeding `overloaded_queue` replaces the prior dataset with 12 tasks
+Expected: parser returns normalized deadline fields, seeding replaces prior dataset.
 
 ### Bundle C: Operation Tools + Task Resolution
 
 Scope:
 
-5. Core operation tools
-   - `create_task`
-   - `update_task`
-   - `delete_task`
-6. Task resolution tool
-   - `resolve_task`
-   - exact match
-   - partial lexical match
-   - ambiguity candidate list
+5. Core operation tools — `create_task`, `update_task`, `delete_task`.
+6. Task resolution — `resolve_task` with exact/ambiguous/none thresholds.
 
 Verification:
 
 ```bash
 bun run typecheck
-
 bun run seed -- --energy well_rested --tasks deadline_pressure
-
-bun run tools -- fetch-tasks
-bun run tools -- fetch-energy
-
 bun run tools -- resolve-task --query "investor memo"
-bun run tools -- resolve-task --query "schedule"
-
 bun run tools -- create-task --title "Write the report" --effort medium --priority high --duration 90 --deadline "tomorrow at 4pm" --category deep_work
-sqlite3 data/lean-agent.db "select id, title, deadline_at from tasks order by id;"
-
 bun run tools -- resolve-task --query "report"
-bun run tools -- update-task --id 43 --status done --priority critical
-sqlite3 data/lean-agent.db "select id, title, status, priority from tasks where id = 43;"
-
-bun run tools -- fetch-tasks
-
-bun run tools -- delete-task --id 43
-sqlite3 data/lean-agent.db "select count(*) from tasks where id = 43;"
+bun run tools -- update-task --id <id> --status done
+bun run tools -- delete-task --id <id>
 ```
 
-Expected checks:
-
-- internal fetch helpers return current seeded state
-- create persists a new task with normalized deadline fields
-- resolve finds real task references
-- update persists status/priority changes
-- default fetch excludes `done` tasks
-- delete removes the row from SQLite
+Expected: resolve finds real task references, CRUD persists correctly, mutation guard blocks unresolved ids.
 
 ### Bundle D: Skills + Subagent Wrappers
 
 Scope:
 
-7. Skill discovery and loader
-   - scan `skills/`
-   - parse frontmatter
-   - `load_skill`
-8. Context wrappers
-   - `get_energy_context`
-   - `get_task_context`
-   - `get_task_list`
-   - trimmed subagent payloads
-   - Anthropic-backed only; no local summarizer branch
+7. Skill discovery and loader — scan `skills/`, parse frontmatter, `load_skill`.
+8. Context wrappers — `get_energy_context`, `get_task_context`, `get_task_list` with trimmed payloads.
 
 Verification:
 
-- `bun run seed -- --energy well_rested --tasks deadline_pressure`
-- `bun run tools list-skills`
-- `bun run tools load-skill --name task-prioritise`
-- `bun run tools get-energy-context --hour 9 --include-payload`
-- `bun run tools get-task-context --include-payload`
-- `bun run tools get-task-list --include-payload`
-- inspect returned compact summaries
-- confirm `get_energy_context` payload includes only `date`, `timezone`, `currentHour`, `hours`
-- confirm `get_task_context` payload trims tasks to `id`, `title`, `effort`, `priority`, `durationMinutes`, `deadlineAt`, `status`
-- confirm `get_task_list` payload trims tasks to `id`, `title`, `effort`, `priority`, `durationMinutes`, `deadlineAt`, `status`
+```bash
+bun run seed -- --energy well_rested --tasks deadline_pressure
+bun run tools list-skills
+bun run tools load-skill --name task-prioritise
+bun run tools get-energy-context --hour 9 --include-payload
+bun run tools get-task-context --include-payload
+bun run tools get-task-list --include-payload
+```
+
+Expected: skill discovery returns all 5 skills, subagent payloads are trimmed, summaries are compact.
 
 ### Bundle E: Main Agent + CLI
 
 Scope:
 
-9. Main agent
-   - `anthropic.beta.messages.toolRunner({ stream: true })`
-   - Zod-authored tool schemas
-     - in this Bun/Zod 3 stack, keep Zod as the source of truth but convert schemas through a helper before passing them to the SDK tool runner; the SDK's `betaZodTool` expects Zod 4's `z.toJSONSchema()`
-   - do not inject active seed labels into the system prompt; the agent should reason from time, tools, and returned data instead
-   - tool event handling
-10. CLI shell
-   - `chat` command
-   - destructive startup seed
-   - token count display after each turn
-   - rich scenario picker for energy/tasks
-   - default to the current local hour unless `--hour` is explicitly provided
-   - loading spinner while waiting for the full assistant response
-   - print `[skill: ...]`, `[tool: ...]`, and `[subagent: ...]` immediately when those events occur; stop the spinner on the first such event so the user sees tool activity before the final rendered Markdown response
-   - terminal-friendly Markdown rendering for assistant output
-   - tool/subagent log lines
+9. Main agent — `generateText` + `prepareStep`, Zod tool schemas via `zod-to-json-schema`, step state selection, message pruning.
+10. CLI shell — Clack input, spinner, immediate log lines, markdown rendering, token usage display, `--trace-agent`.
 
 Verification:
 
-- `bun run typecheck`
-- `bun run chat --help`
-- `printf "%s\n%s\n" "show me my tasks" "quit" | bun run chat --energy well_rested --tasks deadline_pressure --hour 9`
-- `printf "%s\n%s\n" "how's my energy right now?" "quit" | bun run chat --energy well_rested --tasks deadline_pressure --hour 9`
-- inspect startup output, richer picker UX, rendered assistant output, and `[context: ...]` token display
-- inspect tool log lines like `[skill: ...]`, `[tool: ...]`, `[subagent: ...]`
-- confirm `load_skill` and the expected operation/context tools are called
-- run these verification chats sequentially, not in parallel, because startup reseeds the same SQLite database and parallel runs can hit `SQLITE_BUSY`
+```bash
+bun run typecheck
+bun run chat --help
+printf "%s\n%s\n" "show me my tasks" "quit" | bun run chat --energy well_rested --tasks deadline_pressure --hour 9
+printf "%s\n%s\n" "how's my energy right now?" "quit" | bun run chat --energy well_rested --tasks deadline_pressure --hour 9
+```
+
+Expected: log lines (`[skill: ...]`, `[tool: ...]`, `[subagent: ...]`) appear, markdown renders, token usage displays. Run sequentially — startup reseeds the same database.
 
 ### Bundle F: Safe Mutation Flow
 
 Scope:
 
-11. Integrate `resolve_task` into conversational update/delete behavior
-   - mutate only after successful resolution
-   - ask for clarification when multiple matches exist
-   - enforce a turn-local mutation guard so `update_task` and `delete_task` are blocked unless `resolve_task` returned one exact task in that same turn
+11. Integrate `resolve_task` into conversational update/delete. Turn-local mutation guard enforced in code.
+
+Verification: ask to update/delete clearly matching and ambiguous tasks. Confirm exact matches mutate, ambiguous ones prompt for clarification.
+
+### Bundle G: Evals
+
+Scope:
+
+12. Deterministic architecture tests
+    - skill routing (`load_skill`)
+    - exact-vs-fuzzy tool search behavior
+    - turn-local mutation guard
+    - cross-turn referential follow-ups from prior assistant text
+13. Token / usage regression tests
+    - per-turn usage aggregation (`turn`, `session`, `main`, `subagents`)
+    - assert no explicit `max_tokens` / `maxTokens` arguments remain in runtime calls
+    - trace-driven step assertions for active tool narrowing
+14. Quality evals
+    - output quality for prioritisation and task listing
+    - scenario-based evaluation over seeded task + energy pairs
+15. Trace harness
+    - reuse `--trace-agent` JSONL structure in tests
+    - assert which tools were active at each step
+    - assert orchestration messages are pruned after consumption
+
+Implementation plan:
+
+1. Add eval config and shared helpers
+   - `evals/vitest.evals.config.ts`
+   - helpers for seeding, running `runChatTurn`, and collecting tool/step traces
+2. Add deterministic routing tests
+   - `show me my tasks` -> `load_skill(task-fetch)` then `search_tools` -> exact `get_task_list`
+   - `how's my energy right now?` -> `load_skill(energy-check)` then exact `get_energy_context`
+   - `what should I work on next?` -> `load_skill(task-prioritise)` then exact `get_task_context` + `get_energy_context`
+3. Add mutation safety tests
+   - exact match mutates only after `resolve_task`
+   - ambiguous match asks for clarification and does not mutate
+   - follow-up references like `complete the first one` resolve from the prior assistant message structure
+4. Add usage / trace regression tests
+   - verify `runChatTurn()` returns aggregated `main`, `subagents`, and `total` usage
+   - verify `search_tools` for known skills returns exact mapped tools only
+   - verify later executor steps only activate `load_skill`, `search_tools`, and the exact functional tools selected for that skill
+   - verify traces record `system`, `messages`, `activeTools`, `toolCalls`, `toolResults`, and `usage`
+5. Add LLM-judge quality evals
+   - prioritisation quality
+   - task-list usefulness / clarity
 
 Verification:
 
-- ask to update/delete a clearly matching task and confirm mutation succeeds
-- ask to update/delete an ambiguous task and confirm the assistant asks for clarification before mutating
+```bash
+bun run typecheck
+bun run vitest --config evals/vitest.evals.config.ts evals/skill-routing.eval.ts
+bun run vitest --config evals/vitest.evals.config.ts evals/task-resolution.eval.ts
+bun run vitest --config evals/vitest.evals.config.ts evals/usage-regression.eval.ts
+bun run vitest --config evals/vitest.evals.config.ts evals/output-quality.eval.ts
+bun run vitest --config evals/vitest.evals.config.ts
+```
 
-### Verification Plan
-
-Token and context tests:
-
-- add deterministic tests for token-budget plumbing using the exact request shape sent to Anthropic
-- assert that the chat UI displays `[context: X / 10,000 tokens]`
-- add a threshold test that forces the tracked context over 8,000 tokens and verifies compaction is triggered before the next main-agent turn
-- assert that compaction preserves:
-  - task mutations from the session
-  - explicit user preferences
-  - unresolved task references
-
-Skill-scoping tests:
-
-- add a deterministic test proving `load_skill` instructions are turn-scoped
-- assert that skill instructions are available in the current request only
-- assert that the next turn does not retain prior skill text in history unless the model loads the skill again
-
-Agent evals:
-
-- skill routing
-- task resolution safety
-- output quality
-- context compaction
-
-Verification:
-
-- trigger a long enough session to force compaction
-- inspect `[context: ...]` and compaction log lines
-- confirm scenario state and task mutations survive compaction
-- run the turn-scoped skill test
-- run the token-budget tests
-- run each eval individually
-- run the full eval suite
+Expected:
+- known skills activate exact mapped tools, not broad fuzzy expansions
+- ambiguous mutation requests never mutate
+- token usage accounting is internally consistent
+- step traces expose enough information to explain high-cost turns
+- quality evals clear the chosen threshold on seeded scenarios
 
 ### Bundle H: Error Handling + Polish
 
 Scope:
 
-14. Error handling and demo polish
-   - malformed tool input handling
-   - API failure handling
-   - empty-state handling
-   - final demo walkthrough
+13. Malformed tool input, API failure, empty-state handling, final demo walkthrough.
 
-Verification:
-
-- intentionally trigger invalid inputs from terminal
-- confirm failures are controlled and legible
-- run the full demo path end to end
+Verification: trigger invalid inputs, confirm controlled failures, run full demo path end to end.
 
 ## Commit Plan
 
-Commit each bundle immediately after verification. Current commit pattern:
+Commit each bundle immediately after verification:
 
 - `bundle-a: bootstrap bun runtime and database foundation`
 - `bundle-b: add deterministic seed data and deadline parsing`
 - `bundle-c: add task and energy operation tools`
-
-Continue the same pattern for later bundles:
-
 - `bundle-d: add skill loading and subagent wrappers`
 - `bundle-e: add main agent and chat cli`
 - `bundle-f: add safe conversational mutation flow`
+- `bundle-g: add evals`
 - `bundle-h: add error handling and polish`

@@ -1,7 +1,9 @@
+import { anthropic } from '@ai-sdk/anthropic';
+import { generateText } from 'ai';
 import type { Task } from '../db/schema.js';
 import { fetchTasks } from '../tools/task-fetch.js';
-import { DEFAULT_SUBAGENT_MODEL, getAnthropicClient } from './anthropic.js';
-import { fromAnthropicUsage, type TokenUsageSummary } from '../usage.js';
+import { DEFAULT_SUBAGENT_MODEL } from './anthropic.js';
+import { fromLanguageModelUsage, type TokenUsageSummary } from '../usage.js';
 
 export type TaskListInput = {
   status?: Task['status'];
@@ -42,24 +44,20 @@ function buildPayload(status?: Task['status']): TaskListPayload {
 async function summarizeTaskList(
   payload: TaskListPayload,
 ): Promise<{ summary: string; usage: TokenUsageSummary }> {
-  const client = getAnthropicClient();
-  const response = await client.messages.create({
-    model: DEFAULT_SUBAGENT_MODEL,
-    max_tokens: 260,
+  const response = await generateText({
+    model: anthropic(DEFAULT_SUBAGENT_MODEL),
     system:
-      'You are a task list formatter. Return a concise, user-facing markdown list of tasks grouped by priority. Include id, title, effort, duration, and deadline when present. Exclude any analysis beyond a one-line count summary.',
+      'You are a task list formatter. Return compact markdown only: one short intro line, then one heading per priority and one bullet per task. Each bullet should include id, title, effort, duration, and deadline when present. No tables. No extra analysis.',
     messages: [
       {
         role: 'user',
-        content: JSON.stringify(payload),
+        content: [{ type: 'text', text: JSON.stringify(payload) }],
       },
     ],
   });
-
-  const textBlock = response.content.find((block) => block.type === 'text');
   return {
-    summary: textBlock?.text.trim() ?? '',
-    usage: fromAnthropicUsage(response.usage),
+    summary: response.text.trim(),
+    usage: fromLanguageModelUsage(response.usage),
   };
 }
 

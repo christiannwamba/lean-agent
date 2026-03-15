@@ -87,14 +87,7 @@ export function loadSkill(name: string, skillsDir = path.join(process.cwd(), 'sk
 }
 
 export function buildSkillSummary(skills: DiscoveredSkill[]): string {
-  const lines = [
-    '## Skills',
-    '',
-    'Use the `load_skill` tool to load specialized instructions before acting on a task.',
-    '',
-    'Available skills:',
-    ...skills.map((skill) => `- ${skill.name}: ${skill.description}`),
-  ];
-
-  return lines.join('\n');
+  return `Skills: ${skills
+    .map((skill) => `${skill.name} (${skill.description})`)
+    .join('; ')}`;
 }

@@ -3,6 +3,7 @@ import { anthropic } from '@ai-sdk/anthropic';
 import {
   generateText,
   jsonSchema,
+  pruneMessages,
   stepCountIs,
   tool,
   type ModelMessage,
@@ -32,6 +33,25 @@ type LogKind = 'skill' | 'tool' | 'subagent';
 
 type AgentLogger = {
   log(kind: LogKind, label: string): void;
+};
+
+export type AgentStepTraceEntry = {
+  turnIndex: number;
+  userInput: string;
+  stepNumber: number;
+  activeSkillName?: string;
+  activeTools: string[];
+  system: string;
+  messages: ModelMessage[];
+  toolCalls: unknown[];
+  toolResults: unknown[];
+  usage: TokenUsageSummary;
+  text: string;
+  finishReason: string;
+};
+
+type AgentTracer = {
+  traceStep(entry: AgentStepTraceEntry): void;
 };
 
 export type TerminalLogger = AgentLogger & {
@@ -103,17 +123,10 @@ const searchToolsInputSchema = z
 
 const loadSkillResultSchema = z.object({
   name: z.string(),
-  description: z.string().optional(),
 });
 
 const searchToolsResultSchema = z.object({
-  tools: z.array(
-    z.object({
-      name: functionalToolNameSchema,
-      description: z.string(),
-      reason: z.string(),
-    }),
-  ),
+  tools: z.array(functionalToolNameSchema),
 });
 
 const FUNCTIONAL_TOOL_METADATA: Record<
@@ -186,6 +199,8 @@ export type ChatTurnParams = {
   history: ModelMessage[];
   userInput: string;
   logger: AgentLogger;
+  turnIndex?: number;
+  tracer?: AgentTracer;
 };
 
 export type ChatTurnResult = {
@@ -234,12 +249,10 @@ function buildBaseSystemPrompt(config: ChatSessionConfig): string {
   return [
     'You are a task-planning CLI assistant for a throwaway demo.',
     'Be concise, practical, and explicit about scheduling tradeoffs.',
-    'Use tools for database-backed actions. Never invent task or energy state.',
-    'At the start of a tool-using trajectory, first call `load_skill`, then call `search_tools` to activate the regular tools you need.',
-    'Only tools returned by `search_tools` are guaranteed to be active on the next step.',
-    'You may call `load_skill` and `search_tools` again later in the same turn if you need to change direction.',
-    'Always use `resolve_task` before `update_task` or `delete_task`.',
-    'If task resolution is ambiguous or missing, ask a short clarification question and do not mutate anything.',
+    'Use tools for database-backed facts. Never invent task or energy state.',
+    'For tool-using work, call `load_skill`, then `search_tools`.',
+    '`search_tools` activates regular tools for the next step. You may call both again later to change direction.',
+    'Before `update_task` or `delete_task`, call `resolve_task`. If resolution is ambiguous or missing, ask a short clarification question and do not mutate anything.',
     formatSessionContext(config),
     buildSkillSummary(skills),
   ].join('\n\n');
@@ -274,26 +287,21 @@ function normalizeQuery(value: string): string[] {
 
 function searchToolCatalog(input: z.infer<typeof searchToolsInputSchema>) {
   const limit = input.limit ?? 5;
+  const exactSkillTools = input.skillName ? SKILL_TOOL_MAP[input.skillName] ?? [] : [];
+
+  // Known skills should activate their exact toolset. Fuzzy expansion is only a fallback.
+  if (exactSkillTools.length > 0) {
+    return {
+      tools: exactSkillTools.slice(0, limit),
+    };
+  }
+
   const queryTokens = normalizeQuery(input.query ?? '');
   const seen = new Set<FunctionalToolName>();
   const matches: Array<{
     name: FunctionalToolName;
-    description: string;
-    reason: string;
     score: number;
   }> = [];
-
-  if (input.skillName) {
-    for (const toolName of SKILL_TOOL_MAP[input.skillName] ?? []) {
-      seen.add(toolName);
-      matches.push({
-        name: toolName,
-        description: FUNCTIONAL_TOOL_METADATA[toolName].description,
-        reason: `recommended for ${input.skillName}`,
-        score: 100,
-      });
-    }
-  }
 
   if (queryTokens.length > 0) {
     for (const toolName of FUNCTIONAL_TOOL_NAMES) {
@@ -317,8 +325,6 @@ function searchToolCatalog(input: z.infer<typeof searchToolsInputSchema>) {
 
       matches.push({
         name: toolName,
-        description: metadata.description,
-        reason: `matches "${input.query}"`,
         score,
       });
     }
@@ -328,7 +334,7 @@ function searchToolCatalog(input: z.infer<typeof searchToolsInputSchema>) {
     tools: matches
       .sort((left, right) => right.score - left.score || left.name.localeCompare(right.name))
       .slice(0, limit)
-      .map(({ score: _score, ...toolMatch }) => toolMatch),
+      .map(({ name }) => name),
   };
 }
 
@@ -369,13 +375,31 @@ function selectStepState<TOOLS extends ToolSet>(steps: StepResult<TOOLS>[]) {
     latestSearch != null &&
     (latestSkill == null || latestSearch.stepNumber >= latestSkill.stepNumber);
   const functionalTools = shouldUseSearchResult
-    ? latestSearch.output.tools.map((tool) => tool.name)
+    ? latestSearch.output.tools
     : [];
 
   return {
     activeSkillName: latestSkill?.output.name,
     activeTools: [...META_TOOL_NAMES, ...functionalTools] as AnyToolName[],
   };
+}
+
+function pruneConsumedOrchestrationMessages(messages: ModelMessage[]): ModelMessage[] {
+  return pruneMessages({
+    messages,
+    reasoning: 'none',
+    toolCalls: [
+      {
+        type: 'before-last-message',
+        tools: [...META_TOOL_NAMES],
+      },
+    ],
+    emptyMessages: 'remove',
+  });
+}
+
+function normalizeSystemPrompt(system: string | undefined): string {
+  return system ?? '';
 }
 
 export function buildTools(
@@ -396,7 +420,6 @@ export function buildTools(
         const skill = loadSkill(name);
         return {
           name: skill.name,
-          description: skill.description,
         };
       },
     }),
@@ -544,6 +567,15 @@ export async function runChatTurn(
   };
   const messages: ModelMessage[] = [...params.history, userMessage];
   let subagentUsage = emptyTokenUsage();
+  const stepInputs = new Map<
+    number,
+    {
+      activeSkillName?: string;
+      activeTools: string[];
+      system: string;
+      messages: ModelMessage[];
+    }
+  >();
   const tools = buildTools(params.config, params.logger, (usage) => {
     subagentUsage = addTokenUsage(subagentUsage, usage);
   });
@@ -556,13 +588,49 @@ export async function runChatTurn(
     activeTools: [...META_TOOL_NAMES],
     stopWhen: stepCountIs(MAX_TOOL_STEPS),
     maxOutputTokens: 1_200,
-    prepareStep: ({ steps }) => {
+    prepareStep: ({ stepNumber, steps, messages }) => {
       const stepState = selectStepState(steps);
+      const nextMessages = pruneConsumedOrchestrationMessages(messages);
+      const nextSystem = buildStepSystemPrompt(
+        params.config,
+        stepState.activeSkillName,
+      );
+
+      stepInputs.set(stepNumber, {
+        activeSkillName: stepState.activeSkillName,
+        activeTools: [...stepState.activeTools],
+        system: nextSystem,
+        messages: nextMessages,
+      });
 
       return {
         activeTools: stepState.activeTools as Array<keyof typeof tools>,
-        system: buildStepSystemPrompt(params.config, stepState.activeSkillName),
+        system: nextSystem,
+        messages: nextMessages,
       };
+    },
+    onStepFinish: (step) => {
+      const stepInput = stepInputs.get(step.stepNumber) ?? {
+        activeSkillName: undefined,
+        activeTools: [...META_TOOL_NAMES],
+        system: normalizeSystemPrompt(buildBaseSystemPrompt(params.config)),
+        messages,
+      };
+
+      params.tracer?.traceStep({
+        turnIndex: params.turnIndex ?? 0,
+        userInput: params.userInput,
+        stepNumber: step.stepNumber,
+        activeSkillName: stepInput.activeSkillName,
+        activeTools: stepInput.activeTools,
+        system: stepInput.system,
+        messages: stepInput.messages,
+        toolCalls: step.toolCalls,
+        toolResults: step.toolResults,
+        usage: fromLanguageModelUsage(step.usage),
+        text: step.text,
+        finishReason: step.finishReason,
+      });
     },
   });
 

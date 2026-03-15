@@ -1,8 +1,10 @@
+import { anthropic } from '@ai-sdk/anthropic';
+import { generateText } from 'ai';
 import type { EnergyDay } from '../db/schema.js';
 import { fetchEnergy } from '../tools/energy-fetch.js';
 import { DEFAULT_REFERENCE_ISO, DEFAULT_TIMEZONE } from '../dates.js';
-import { DEFAULT_SUBAGENT_MODEL, getAnthropicClient } from './anthropic.js';
-import { fromAnthropicUsage, type TokenUsageSummary } from '../usage.js';
+import { DEFAULT_SUBAGENT_MODEL } from './anthropic.js';
+import { fromLanguageModelUsage, type TokenUsageSummary } from '../usage.js';
 
 export type EnergyContextInput = {
   currentHour: number;
@@ -34,24 +36,20 @@ function buildPayload(day: EnergyDay, currentHour: number): EnergyContextPayload
 async function summarizeEnergyContext(
   payload: EnergyContextPayload,
 ): Promise<{ summary: string; usage: TokenUsageSummary }> {
-  const client = getAnthropicClient();
-  const response = await client.messages.create({
-    model: DEFAULT_SUBAGENT_MODEL,
-    max_tokens: 120,
+  const response = await generateText({
+    model: anthropic(DEFAULT_SUBAGENT_MODEL),
     system:
       'You are an energy curve analyst. Return a compact summary: current level, next peak (time range), next dip (time range), next rebound (time range). Max 60 tokens.',
     messages: [
       {
         role: 'user',
-        content: JSON.stringify(payload),
+        content: [{ type: 'text', text: JSON.stringify(payload) }],
       },
     ],
   });
-
-  const textBlock = response.content.find((block) => block.type === 'text');
   return {
-    summary: textBlock?.text.trim() ?? '',
-    usage: fromAnthropicUsage(response.usage),
+    summary: response.text.trim(),
+    usage: fromLanguageModelUsage(response.usage),
   };
 }
 

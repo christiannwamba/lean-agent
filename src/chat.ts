@@ -8,8 +8,10 @@ import type { ModelMessage } from 'ai';
 
 import { DEFAULT_REFERENCE_ISO, DEFAULT_TIMEZONE } from './dates.js';
 import {
+  countSessionContext,
   runChatTurn,
   createTerminalLogger,
+  prepareHistoryForTurn,
   type AgentStepTraceEntry,
   type ChatSessionConfig,
 } from './agent.js';
@@ -29,6 +31,10 @@ type StartupConfig = ChatSessionConfig & {
   energyLabel: string;
   taskLabel: string;
 };
+
+const CONTEXT_TOKEN_BUDGET = 10_000;
+const COMPACTION_THRESHOLD = 8_000;
+const COMPACTION_KEEP_TURNS = 2;
 
 function currentHourInTimezone(timezone: string): number {
   const formatter = new Intl.DateTimeFormat('en-GB', {
@@ -112,10 +118,12 @@ async function runChat(options: ChatOptions): Promise<void> {
   intro('lean-agent');
   console.log(`Seeded demo with energy=${config.energyLabel}, tasks=${config.taskLabel}, hour=${config.currentHour}, tz=${config.timezone}`);
   if (traceFilePath) {
-    console.log(`Tracing agent steps to ${traceFilePath}`);
+  console.log(`Tracing agent steps to ${traceFilePath}`);
   }
   console.log('Type `exit` or `quit` to end the session.');
   let history: ModelMessage[] = [];
+  let historySummary: string | undefined;
+  let currentContextTokens = 0;
   let sessionTokenTotal = 0;
   let turnIndex = 0;
 
@@ -173,9 +181,21 @@ async function runChat(options: ChatOptions): Promise<void> {
       });
       startLoading('Thinking...');
 
+      const compaction = await prepareHistoryForTurn({
+        config,
+        history,
+        historySummary,
+        userInput: input,
+        thresholdTokens: COMPACTION_THRESHOLD,
+        keepTurns: COMPACTION_KEEP_TURNS,
+      });
+      history = compaction.history;
+      historySummary = compaction.historySummary;
+
       const result = await runChatTurn({
         config,
         history,
+        historySummary,
         userInput: input,
         logger,
         turnIndex,
@@ -191,8 +211,15 @@ async function runChat(options: ChatOptions): Promise<void> {
       stopLoading();
 
       history = result.history;
-      sessionTokenTotal += result.usage.total.totalTokens;
+      const turnTokenTotal =
+        result.usage.total.totalTokens + compaction.usage.totalTokens;
+      sessionTokenTotal += turnTokenTotal;
       turnIndex += 1;
+      currentContextTokens = await countSessionContext({
+        config,
+        history,
+        historySummary,
+      });
 
       const rendered = renderAssistantOutput(result.assistantText);
       if (rendered) {
@@ -201,7 +228,7 @@ async function runChat(options: ChatOptions): Promise<void> {
 
       console.log(
         chalk.dim(
-          `[tokens: turn ${result.usage.total.totalTokens.toLocaleString()} | session ${sessionTokenTotal.toLocaleString()} | main ${result.usage.main.totalTokens.toLocaleString()} | subagents ${result.usage.subagents.totalTokens.toLocaleString()}]`,
+          `[tokens: turn ${turnTokenTotal.toLocaleString()} | session ${sessionTokenTotal.toLocaleString()} | main ${result.usage.main.totalTokens.toLocaleString()} | subagents ${result.usage.subagents.totalTokens.toLocaleString()}${compaction.compacted ? ` | compaction ${compaction.usage.totalTokens.toLocaleString()}` : ''} | context ${currentContextTokens.toLocaleString()}/${CONTEXT_TOKEN_BUDGET.toLocaleString()}]`,
         ),
       );
     }

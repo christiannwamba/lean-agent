@@ -1,6 +1,8 @@
 import chalk from 'chalk';
+import Anthropic from '@anthropic-ai/sdk';
 import { anthropic } from '@ai-sdk/anthropic';
 import {
+  asSchema,
   generateText,
   pruneMessages,
   stepCountIs,
@@ -195,6 +197,7 @@ export type ChatSessionConfig = {
 export type ChatTurnParams = {
   config: ChatSessionConfig;
   history: ModelMessage[];
+  historySummary?: string;
   userInput: string;
   logger: AgentLogger;
   turnIndex?: number;
@@ -210,6 +213,18 @@ export type ChatTurnResult = {
     total: TokenUsageSummary;
   };
 };
+
+export type HistoryCompactionResult = {
+  history: ModelMessage[];
+  historySummary?: string;
+  contextTokens: number;
+  compacted: boolean;
+  usage: TokenUsageSummary;
+};
+
+const anthropicClient = process.env.ANTHROPIC_API_KEY
+  ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+  : null;
 
 function aiTool<Schema extends z.ZodTypeAny, Output>(options: {
   description: string;
@@ -234,7 +249,10 @@ function formatSessionContext(config: ChatSessionConfig): string {
   ].join('\n');
 }
 
-function buildBaseSystemPrompt(config: ChatSessionConfig): string {
+function buildBaseSystemPrompt(
+  config: ChatSessionConfig,
+  historySummary?: string,
+): string {
   const skills = discoverSkills();
 
   return [
@@ -245,22 +263,26 @@ function buildBaseSystemPrompt(config: ChatSessionConfig): string {
     '`search_tools` activates regular tools for the next step. You may call both again later to change direction.',
     'Before `update_task` or `delete_task`, call `resolve_task`. If resolution is ambiguous or missing, ask a short clarification question and do not mutate anything.',
     formatSessionContext(config),
+    historySummary ? ['## Conversation Summary', historySummary].join('\n') : undefined,
     buildSkillSummary(skills),
-  ].join('\n\n');
+  ]
+    .filter(Boolean)
+    .join('\n\n');
 }
 
 function buildStepSystemPrompt(
   config: ChatSessionConfig,
   activeSkillName?: string,
+  historySummary?: string,
 ): string {
   if (!activeSkillName) {
-    return buildBaseSystemPrompt(config);
+    return buildBaseSystemPrompt(config, historySummary);
   }
 
   const skill = loadSkill(activeSkillName);
 
   return [
-    buildBaseSystemPrompt(config),
+    buildBaseSystemPrompt(config, historySummary),
     '## Active Skill',
     `Current skill: ${skill.name}`,
     skill.instructions,
@@ -414,6 +436,204 @@ function pruneConsumedOrchestrationMessages(messages: ModelMessage[]): ModelMess
 
 function normalizeSystemPrompt(system: string | undefined): string {
   return system ?? '';
+}
+
+function extractTextContent(content: ModelMessage['content']): string {
+  if (typeof content === 'string') {
+    return content;
+  }
+
+  return content
+    .filter((part): part is Extract<(typeof content)[number], { type: 'text' }> => part.type === 'text')
+    .map((part) => part.text)
+    .join('\n')
+    .trim();
+}
+
+function toAnthropicMessages(messages: ModelMessage[]): Anthropic.Messages.MessageParam[] {
+  return messages
+    .filter(
+      (message): message is Extract<ModelMessage, { role: 'user' | 'assistant' }> =>
+        message.role === 'user' || message.role === 'assistant',
+    )
+    .map((message) => ({
+      role: message.role,
+      content: extractTextContent(message.content),
+    }));
+}
+
+async function buildCountableTools(
+  tools: Record<
+    MetaToolName,
+    {
+      description?: string;
+      inputSchema: unknown;
+    }
+  >,
+): Promise<Anthropic.Messages.MessageCountTokensTool[]> {
+  return Promise.all(
+    META_TOOL_NAMES.map(async (toolName) => ({
+      name: toolName,
+      description: tools[toolName].description,
+      input_schema: await asSchema(tools[toolName].inputSchema as never).jsonSchema,
+    })),
+  );
+}
+
+function formatTranscriptForSummary(messages: ModelMessage[]): string {
+  return messages
+    .map((message) => {
+      const text = extractTextContent(message.content);
+
+      return `${message.role.toUpperCase()}: ${text}`;
+    })
+    .filter(Boolean)
+    .join('\n\n');
+}
+
+function splitHistoryIntoTurns(history: ModelMessage[]): ModelMessage[][] {
+  const turns: ModelMessage[][] = [];
+
+  for (let index = 0; index < history.length; index += 2) {
+    turns.push(history.slice(index, index + 2));
+  }
+
+  return turns;
+}
+
+async function countContextTokens(input: {
+  config: ChatSessionConfig;
+  history: ModelMessage[];
+  historySummary?: string;
+  userInput?: string;
+}): Promise<number> {
+  if (!anthropicClient) {
+    return 0;
+  }
+
+  const messages = input.userInput
+    ? [
+        ...input.history,
+        {
+          role: 'user' as const,
+          content: [{ type: 'text' as const, text: input.userInput }],
+        },
+      ]
+    : input.history;
+  if (messages.length === 0) {
+    return 0;
+  }
+  const silentLogger: AgentLogger = { log() {} };
+  const tools = buildTools(input.config, silentLogger, () => {});
+  const countableTools = await buildCountableTools({
+    load_skill: tools.load_skill,
+    search_tools: tools.search_tools,
+  });
+  const result = await anthropicClient.messages.countTokens({
+    model: DEFAULT_CHAT_MODEL,
+    system: buildBaseSystemPrompt(input.config, input.historySummary),
+    messages: toAnthropicMessages(messages),
+    tools: countableTools,
+  });
+
+  return result.input_tokens;
+}
+
+async function summarizeCompactedHistory(input: {
+  historySummary?: string;
+  prunedMessages: ModelMessage[];
+}): Promise<{ summary: string; usage: TokenUsageSummary }> {
+  const existingSummary = input.historySummary?.trim();
+  const transcript = formatTranscriptForSummary(input.prunedMessages);
+  const response = await generateText({
+    model: anthropic(DEFAULT_CHAT_MODEL),
+    system: [
+      'Summarize older conversation history for context compaction.',
+      'Preserve durable facts needed for future turns.',
+      'Keep task names, ordering references, completed mutations, pending clarifications, and user goals.',
+      'Be concise. Use short markdown bullets.',
+    ].join(' '),
+    prompt: [
+      existingSummary ? `Existing summary:\n${existingSummary}` : undefined,
+      transcript ? `Older transcript to compact:\n${transcript}` : undefined,
+    ]
+      .filter(Boolean)
+      .join('\n\n'),
+  });
+
+  return {
+    summary: response.text.trim(),
+    usage: fromLanguageModelUsage(response.usage),
+  };
+}
+
+export async function prepareHistoryForTurn(input: {
+  config: ChatSessionConfig;
+  history: ModelMessage[];
+  historySummary?: string;
+  userInput: string;
+  thresholdTokens: number;
+  keepTurns: number;
+}): Promise<HistoryCompactionResult> {
+  const initialContextTokens = await countContextTokens({
+    config: input.config,
+    history: input.history,
+    historySummary: input.historySummary,
+    userInput: input.userInput,
+  });
+
+  if (initialContextTokens < input.thresholdTokens) {
+    return {
+      history: input.history,
+      historySummary: input.historySummary,
+      contextTokens: initialContextTokens,
+      compacted: false,
+      usage: emptyTokenUsage(),
+    };
+  }
+
+  const turns = splitHistoryIntoTurns(input.history);
+  const retainedTurns = turns.slice(-input.keepTurns);
+  const prunedTurns = turns.slice(0, Math.max(0, turns.length - input.keepTurns));
+  const retainedHistory = retainedTurns.flat();
+  const prunedMessages = prunedTurns.flat();
+
+  if (prunedMessages.length === 0) {
+    return {
+      history: input.history,
+      historySummary: input.historySummary,
+      contextTokens: initialContextTokens,
+      compacted: false,
+      usage: emptyTokenUsage(),
+    };
+  }
+
+  const summaryResult = await summarizeCompactedHistory({
+    historySummary: input.historySummary,
+    prunedMessages,
+  });
+  const compactedContextTokens = await countContextTokens({
+    config: input.config,
+    history: retainedHistory,
+    historySummary: summaryResult.summary,
+    userInput: input.userInput,
+  });
+
+  return {
+    history: retainedHistory,
+    historySummary: summaryResult.summary,
+    contextTokens: compactedContextTokens,
+    compacted: true,
+    usage: summaryResult.usage,
+  };
+}
+
+export async function countSessionContext(input: {
+  config: ChatSessionConfig;
+  history: ModelMessage[];
+  historySummary?: string;
+}): Promise<number> {
+  return countContextTokens(input);
 }
 
 export function buildTools(
@@ -596,18 +816,18 @@ export async function runChatTurn(
 
   const result = await generateText({
     model: anthropic(DEFAULT_CHAT_MODEL),
-    system: buildBaseSystemPrompt(params.config),
+    system: buildBaseSystemPrompt(params.config, params.historySummary),
     messages,
     tools,
     activeTools: [...META_TOOL_NAMES],
     stopWhen: stepCountIs(MAX_TOOL_STEPS),
-    maxOutputTokens: 1_200,
     prepareStep: ({ stepNumber, steps, messages }) => {
       const stepState = selectStepState(steps);
       const nextMessages = pruneConsumedOrchestrationMessages(messages);
       const nextSystem = buildStepSystemPrompt(
         params.config,
         stepState.activeSkillName,
+        params.historySummary,
       );
 
       stepInputs.set(stepNumber, {
@@ -627,7 +847,9 @@ export async function runChatTurn(
       const stepInput = stepInputs.get(step.stepNumber) ?? {
         activeSkillName: undefined,
         activeTools: [...META_TOOL_NAMES],
-        system: normalizeSystemPrompt(buildBaseSystemPrompt(params.config)),
+        system: normalizeSystemPrompt(
+          buildBaseSystemPrompt(params.config, params.historySummary),
+        ),
         messages,
       };
 

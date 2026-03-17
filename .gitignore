@@ -3,3 +3,4 @@ data/*.db
 data/*.db-*
 drizzle
 traces
+.DS_Store

@@ -25,20 +25,6 @@ export function addTokenUsage(
   };
 }
 
-export function fromAnthropicUsage(usage?: {
-  input_tokens: number;
-  output_tokens: number;
-}): TokenUsageSummary {
-  const inputTokens = usage?.input_tokens ?? 0;
-  const outputTokens = usage?.output_tokens ?? 0;
-
-  return {
-    inputTokens,
-    outputTokens,
-    totalTokens: inputTokens + outputTokens,
-  };
-}
-
 export function fromLanguageModelUsage(
   usage?: Partial<LanguageModelUsage>,
 ): TokenUsageSummary {

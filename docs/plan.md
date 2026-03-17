@@ -61,6 +61,7 @@ lean-agent/
 │   ├── skill-routing.eval.ts    # Deterministic + live routing tests
 │   ├── task-resolution.eval.ts  # Resolution rules + live mutation safety
 │   ├── usage-regression.eval.ts # Token cap assertions + tool narrowing + trace completeness
+│   ├── compaction.eval.ts       # Context compaction and preflight counting tests
 │   ├── output-quality.eval.ts   # LLM-as-judge quality tests
 │   └── trajectory.eval.ts       # Multi-turn follow-ups + mid-trajectory course corrections
 ├── drizzle.config.ts
@@ -387,21 +388,64 @@ Token accounting is a first-class product behavior, not a background budget.
 After each turn, the CLI displays:
 
 ```
-[tokens: turn 4,231 | session 12,847 | main 3,102 | subagents 1,129]
+[tokens: turn 4,231 | session 12,847 | main 3,102 | subagents 1,129 | compaction 412 | context 7,200/10,000]
 ```
 
-- **turn** — total tokens for this user turn (main + subagents)
+- **turn** — total tokens for this user turn (main + subagents + compaction)
 - **session** — cumulative sum across all turns in this chat session
 - **main** — main agent steps only (from `result.totalUsage`)
 - **subagents** — separate subagent calls only (tracked via `trackSubagentUsage` callback)
+- **compaction** — tokens used by the summary call (only shown when compaction fires)
+- **context** — current projected context tokens vs. the budget cap
 
 ### Why this matters
 
-Most token cost comes from repeated input (system prompt + message history sent on every step), not output. The main/subagent split makes this visible. The session total tracks cumulative cost across the demo.
+Most token cost comes from repeated input (system prompt + message history sent on every step), not output. The main/subagent split makes this visible. The session total tracks cumulative cost across the demo. Context compaction keeps long sessions within budget by summarizing older turns (see the Context compaction section above).
 
-### No compaction
+### Context compaction
 
-The earlier plan specified a 10,000-token budget with compaction at 8,000. This is no longer implemented. History growth is linear (text-only, no tool history), so compaction is not needed for the demo scope. If session length grows to require it, it can be added later without architectural changes.
+Compaction prevents unbounded context growth in long sessions. It uses the Anthropic `countTokens` API for preflight measurement and a summarization step to compress older turns.
+
+#### Budget and thresholds
+
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `CONTEXT_TOKEN_BUDGET` | 10,000 | Display cap shown in the token line |
+| `COMPACTION_THRESHOLD` | 8,000 | Trigger compaction when projected context exceeds this |
+| `COMPACTION_KEEP_TURNS` | 2 | Number of recent user/assistant turn pairs to retain verbatim |
+
+#### Preflight token counting
+
+`countContextTokens` calls the Anthropic SDK `messages.countTokens` endpoint before each turn. It builds the full payload the model would see — system prompt (including any existing `historySummary`), conversation history, the new user message, and meta tool definitions — and returns the projected `input_tokens`. If no `ANTHROPIC_API_KEY` is set, it returns 0 (graceful degradation for deterministic tests).
+
+#### Compaction flow (`prepareHistoryForTurn`)
+
+1. Count projected context tokens for the current history + new user input.
+2. If below `COMPACTION_THRESHOLD`, return the history unchanged.
+3. Split history into user/assistant turn pairs.
+4. Retain the last `keepTurns` pairs verbatim.
+5. Feed the older (pruned) turns — plus any existing `historySummary` — into `summarizeCompactedHistory`.
+6. The summary call uses `generateText` with a focused system prompt that preserves durable facts: task names, ordering references, completed mutations, pending clarifications, and user goals.
+7. Re-count context tokens with the compacted history + new summary to confirm reduction.
+8. Return `{ history, historySummary, contextTokens, compacted, usage }`.
+
+#### Summary injection
+
+The `historySummary` string is injected into the system prompt under a `## Conversation Summary` heading by `buildBaseSystemPrompt`. It appears in every step's system prompt (via `buildStepSystemPrompt`) so the model retains awareness of older context without carrying the full message history.
+
+#### Token display
+
+After compaction, the CLI token line includes compaction cost and context budget:
+
+```
+[tokens: turn 4,231 | session 12,847 | main 3,102 | subagents 1,129 | compaction 412 | context 7,200/10,000]
+```
+
+The `compaction` segment only appears on turns where compaction fired. The `context` segment always shows current context tokens against the budget.
+
+#### Direct Anthropic SDK usage
+
+Compaction introduces a direct `@anthropic-ai/sdk` dependency alongside the Vercel AI SDK. The `countTokens` endpoint is not available through the AI SDK, so an `Anthropic` client is instantiated at module level (guarded by `ANTHROPIC_API_KEY` presence). Tool schemas are converted via the AI SDK's `asSchema` utility to produce the JSON Schema format that `countTokens` expects.
 
 ---
 
@@ -558,7 +602,14 @@ expect(searchToolCatalog({ skillName: 'task-fetch', query: 'show tasks' })).toEq
 | `poor_sleep` × `deadline_pressure`, hour 11 | Does the response account for low energy, deadline urgency, and recommend *when* to do work? | 3 |
 | `well_rested` × `deadline_pressure` | Does the response clearly list open tasks, group meaningfully, and surface deadline risk? | 4 |
 
-### Eval 5: Trajectory handling (`trajectory.eval.ts`)
+### Eval 5: Context compaction (`compaction.eval.ts`)
+
+**Live tier only.** Tests preflight token counting and history compaction.
+
+- **First-turn baseline:** Empty history with a short user input. Verifies `prepareHistoryForTurn` returns `compacted: false`, positive `contextTokens`, and zero compaction usage.
+- **Multi-turn compaction:** 3 turn pairs with `thresholdTokens: 1` (force compaction). Verifies the last 2 turns are retained verbatim, older turns are summarized into `historySummary` that preserves key facts (e.g. task names like "Finalize investor memo"), and compaction usage tokens are positive.
+
+### Eval 6: Trajectory handling (`trajectory.eval.ts`)
 
 **Live tier only.** Tests multi-turn coherence and mid-trajectory course correction.
 
@@ -761,6 +812,7 @@ bun run typecheck
 bun test --timeout=120000 evals/skill-routing.eval.ts
 bun test --timeout=120000 evals/task-resolution.eval.ts
 bun test --timeout=120000 evals/usage-regression.eval.ts
+bun test --timeout=120000 evals/compaction.eval.ts
 bun test --timeout=120000 evals/output-quality.eval.ts
 bun test --timeout=120000 evals/trajectory.eval.ts
 bun run evals

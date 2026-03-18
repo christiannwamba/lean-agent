@@ -136,18 +136,6 @@ function pruneConsumedOrchestrationMessages(messages: ModelMessage[]): ModelMess
 
 `META_TOOL_NAMES` targets only the routing tools. Everything else stays. Functional tool results (like subagent summaries) remain in the conversation because subagents have already compressed them at the source. That data is already lean. If we pruned it, the model would lose information it needs to reason across the rest of the turn. You never need to prune data you've already made compact before it entered the window.
 
-Between turns, the history is reduced to text messages only:
-
-```typescript
-return {
-  history: [...params.history, userMessage, assistantMessage],
-  assistantText,
-  usage: { main: mainUsage, subagents: subagentUsage, total: totalUsage },
-};
-```
-
-Where `userMessage` and `assistantMessage` contain only `[{ type: 'text', text: '...' }]`. This is safe because the subagent summaries have already been synthesized into the assistant's final response. The assistant's text is the conclusion. Context growth is linear: one user message and one assistant response per turn.
-
 #### 2. Subagents handle data fetching and reasoning
 
 When the main agent needs task data or energy data, it doesn't fetch raw database rows and reason about them in-context. That would pull it off its trajectory, burning steps on data interpretation instead of answering the user's question.

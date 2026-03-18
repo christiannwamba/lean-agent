@@ -5,14 +5,14 @@
 | Layer | Tool | Why |
 |-------|------|-----|
 | Runtime | `Bun` | Bun-first CLI runtime with native SQLite support and fast local execution. |
-| LLM | `ai` + `@ai-sdk/anthropic` | Vercel AI SDK. `generateText` with `prepareStep` for step-level tool activation and system prompt injection. Better fit for the Next.js / Vercel-native audience. |
+| LLM | `ai` + `@ai-sdk/anthropic` | AI SDK. `generateText` with `prepareStep` for step-level tool activation and system prompt injection. Better fit for the Next.js audience. |
 | Database | `bun:sqlite` + `drizzle-orm/bun-sqlite` | Clean Bun-native SQLite path for a local demo. |
 | Date parsing | `chrono-node` | Parse natural-language deadlines into normalized timestamps. GB-biased (`en.GB`), `Europe/London` default. |
 | Scenario picker | `@clack/prompts` | Minimal, modern terminal UI for scenario selection and ongoing chat input. |
 | CLI output | `chalk` + `cli-markdown` | Colored log lines plus terminal-friendly Markdown rendering for assistant output. |
 | CLI commands | `commander` | Zero-dependency arg parser. Flags for `--energy`, `--tasks`, `--hour`, `--tz`, `--ref`, `--trace-agent`. |
 | Spinner | `@clack/prompts` spinner | Loading state while the assistant turn is in progress. |
-| Evals | `bun:test` | Bun's built-in test runner. Two-tier eval structure: deterministic tests (no API key) and live tests (real agent calls). Custom `judgeOutput` helper using Vercel AI SDK structured output for LLM-as-judge scoring. |
+| Evals | `bun:test` | Bun's built-in test runner. Two-tier eval structure: deterministic tests (no API key) and live tests (real agent calls). Custom `judgeOutput` helper using AI SDK structured output for LLM-as-judge scoring. |
 | Validation | `zod` + `zod-to-json-schema` | Schema validation for tool inputs and type derivation. Zod 3 schemas are converted to JSON Schema before handing to the AI SDK. |
 
 ---
@@ -122,7 +122,7 @@ Schema sync: `drizzle-kit push`. No migrations.
 
 ## Orchestration Model
 
-The main agent uses Vercel AI SDK's `generateText` with `prepareStep` for step-level control. This replaces the earlier Anthropic SDK `toolRunner` approach.
+The main agent uses AI SDK's `generateText` with `prepareStep` for step-level control. This replaces the earlier Anthropic SDK `toolRunner` approach.
 
 ### Why `prepareStep`
 
@@ -445,7 +445,7 @@ The `compaction` segment only appears on turns where compaction fired. The `cont
 
 #### Direct Anthropic SDK usage
 
-Compaction introduces a direct `@anthropic-ai/sdk` dependency alongside the Vercel AI SDK. The `countTokens` endpoint is not available through the AI SDK, so an `Anthropic` client is instantiated at module level (guarded by `ANTHROPIC_API_KEY` presence). Tool schemas are converted via the AI SDK's `asSchema` utility to produce the JSON Schema format that `countTokens` expects.
+Compaction introduces a direct `@anthropic-ai/sdk` dependency alongside the AI SDK. The `countTokens` endpoint is not available through the AI SDK, so an `Anthropic` client is instantiated at module level (guarded by `ANTHROPIC_API_KEY` presence). Tool schemas are converted via the AI SDK's `asSchema` utility to produce the JSON Schema format that `countTokens` expects.
 
 ---
 

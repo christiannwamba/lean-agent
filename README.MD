@@ -6,7 +6,7 @@ Built with the [AI SDK](https://sdk.vercel.ai), [Claude](https://anthropic.com),
 
 > Every line of harness code is a vote of no confidence in your model.
 
-For the full story behind this architecture, read [The Most Expensive Cheap Model I Ever Used](BLOG_LINK).
+For the full story behind this architecture, read [The Most Expensive Cheap Model I Ever Used](https://lean-agent.vercel.app).
 
 ## Quick Start
 

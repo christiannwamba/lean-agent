@@ -407,7 +407,3 @@ lean-agent/
 ├── LICENSE.md
 └── tsconfig.json
 ```
-
-## License
-
-[MIT](LICENSE.md)

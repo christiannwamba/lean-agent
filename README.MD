@@ -2,7 +2,7 @@
 
 A CLI agent that schedules your tasks around your energy curve. Built to demonstrate how to keep an AI agent's context hygienic so it stays sharp, cheap, and recoverable across long conversations.
 
-Built with the [AI SDK](https://sdk.vercel.ai), [Claude](https://anthropic.com), and [Bun](https://bun.sh).
+Built with the [AI SDK](https://github.com/vercel/ai), [Claude](https://anthropic.com), and [Bun](https://bun.sh).
 
 > Every line of harness code is a vote of no confidence in your model.
 
